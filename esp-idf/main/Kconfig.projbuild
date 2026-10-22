@@ -1,0 +1,30 @@
+menu "BesBot"
+    config BESBOT_IN1_GPIO
+        int "GPIO to L298N IN1 (left motor, forward)"
+        default 9
+    config BESBOT_IN2_GPIO
+        int "GPIO to L298N IN2 (left motor, backward)"
+        default 10
+    config BESBOT_IN3_GPIO
+        int "GPIO to L298N IN3 (right motor, forward)"
+        default 25
+    config BESBOT_IN4_GPIO
+        int "GPIO to L298N IN4 (right motor, backward)"
+        default 26
+    config BESBOT_MAX_PCT
+        int "Default top speed in percent (changeable on the page)"
+        default 70
+        range 10 100
+    config BESBOT_LED_GPIO
+        int "GPIO of the on-board RGB LED"
+        default 27
+        help
+            ESP32-C5-DevKitC-1: the addressable RGB LED (WS2812) sits on GPIO27.
+    config BESBOT_LED_SWAP_RG
+        bool "The LED's red and green are swapped (Waveshare ESP32-C5 boards)"
+        default y
+    config BESBOT_BRIGHTNESS
+        int "LED brightness in percent"
+        default 25
+        range 1 100
+endmenu

@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>BesBot</title>
+<style>
+  :root { color-scheme: light dark; --bg:#f6f7f9; --fg:#1d232b; --muted:#5b6673; --card:#fff; --line:#dde2e8; --accent:#0b62c4; --ok:#2e9e5b; --warn:#d98b0b; --bad:#d23b3b; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#14181d; --fg:#e7ebf0; --muted:#9aa5b1; --card:#1c2128; --line:#2c333c; --accent:#5aa2ff; --ok:#4cc784; --warn:#f0a93a; --bad:#f06a6a; } }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, sans-serif; max-width:720px; margin-inline:auto; }
+  h1 { margin:0 0 2px; font-size:1.5rem; }
+  .sub { color:var(--muted); margin:0 0 14px; font-size:.9rem; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; margin-bottom:14px; }
+  .row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; background:var(--muted); margin-right:6px; vertical-align:middle; }
+  .dot.ok { background:var(--ok); } .dot.warn { background:var(--warn); } .dot.bad { background:var(--bad); }
+  #pad { display:block; margin:6px auto; touch-action:none; user-select:none; -webkit-user-select:none; max-width:100%; }
+  .bars { display:grid; grid-template-columns:auto 1fr 3.5em; gap:6px 10px; align-items:center; font-variant-numeric:tabular-nums; }
+  .bar { height:12px; background:var(--line); border-radius:6px; position:relative; overflow:hidden; }
+  .bar b { position:absolute; top:0; bottom:0; left:50%; background:var(--accent); }
+  .muted { color:var(--muted); font-size:.88rem; }
+  button { font:inherit; padding:8px 16px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--fg); cursor:pointer; }
+  button.stop { background:var(--bad); color:#fff; border-color:var(--bad); font-weight:600; padding:10px 22px; }
+  label { display:flex; align-items:center; gap:8px; }
+  input[type=range] { flex:1; min-width:120px; }
+  details summary { cursor:pointer; color:var(--muted); }
+  .set { display:grid; gap:10px; margin-top:10px; }
+  .set label span:first-child { min-width:9em; }
+  .set output { min-width:3.5em; text-align:right; font-variant-numeric:tabular-nums; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<h1 id="title">BesBot</h1>
+<p class="sub">Drive with the pad (touch or mouse) or the keyboard: arrow keys or W A S D, space to stop. The robot stops by itself when the commands stop coming.</p>
+
+<div class="card">
+  <div class="row">
+    <span><span id="dot" class="dot"></span><span id="conn">connecting…</span></span>
+    <span id="driver" class="muted"></span>
+    <span style="flex:1"></span>
+    <button class="stop" id="stop">STOP</button>
+  </div>
+  <canvas id="pad" width="300" height="300"></canvas>
+  <div class="bars">
+    <span>Left</span><div class="bar"><b id="lb"></b></div><span id="lv">0 %</span>
+    <span>Right</span><div class="bar"><b id="rb"></b></div><span id="rv">0 %</span>
+  </div>
+  <p class="muted" id="wifi" style="margin:10px 0 0"></p>
+</div>
+
+<div class="card">
+  <details>
+    <summary>Settings</summary>
+    <div class="set">
+      <label><span>Top speed</span><input type="range" id="max" min="10" max="100" step="5"><output id="maxo"></output></label>
+      <label><span>Acceleration</span><input type="range" id="accel" min="2" max="100" step="1"><output id="accelo"></output></label>
+      <label><span>Trim (pulls right: +)</span><input type="range" id="trim" min="-20" max="20" step="1"><output id="trimo"></output></label>
+      <label><span>Minimum power</span><input type="range" id="min" min="0" max="60" step="5"><output id="mino"></output></label>
+      <label><input type="checkbox" id="rev_left"> Left motor runs backwards (reverse it)</label>
+      <label><input type="checkbox" id="rev_right"> Right motor runs backwards (reverse it)</label>
+      <p class="muted" style="margin:0">Acceleration: how much the speed may change per 0.1 s (100 %: at once). Minimum power: the motors start at this power instead of humming at low settings. Saved on the robot.</p>
+    </div>
+  </details>
+</div>
+<p class="muted">More ways to drive (gamepad, SpaceMouse, HandTool, ATLAS), the Wi-Fi history and the robot's status: <a href="https://closer.ram.eemcs.utwente.nl/labdemos/demo?id=besbot">the lab demos page</a>.</p>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let ws = null, state = {}, cmd = { x: 0, y: 0 }, src = "touch", lastSent = 0, padActive = false, keys = new Set();
+
+function wsUrl() {
+  let u = new URL("ws", location.href);
+  u.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  return u.href;
+}
+// Through the lab demos site (same origin) the admin login may be needed to drive: the first message carries it.
+function adminToken() {
+  try { return location.pathname.includes("/device/") ? localStorage.getItem("labdemosAdminToken") || "" : ""; } catch (e) { return ""; }
+}
+function connect() {
+  if (document.hidden || ws) return;
+  ws = new WebSocket(wsUrl());
+  ws.onopen = () => { const t = adminToken(); if (t) ws.send(JSON.stringify({ admin_token: t })); ws.send("stream"); $("conn").textContent = "connected"; $("dot").className = "dot ok"; };
+  ws.onclose = (ev) => {
+    $("dot").className = "dot bad";
+    $("conn").textContent = ev.code === 4401 ? "driving through this site needs the admin login (lab demos page)" :
+      ev.code === 4429 ? "too many pages are connected: close other BesBot tabs (retrying…)" : "connection lost, retrying…";
+    ws = null; setTimeout(connect, ev.code === 4401 ? 15000 : ev.code === 4429 ? 5000 : 2000);
+  };
+  ws.onmessage = (ev) => {
+    let j; try { j = JSON.parse(ev.data); } catch (e) { return; }
+    if (j.busy) { $("driver").textContent = "Someone else is driving: wait until they stop."; return; }
+    if (j.drive) { state = j; showDrive(); }
+    else if (j.wifi) showWifi(j);
+  };
+}
+function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+
+function showDrive() {
+  const s = state;
+  if (s.host && s.host !== "besbot") { $("title").textContent = "BesBot (" + s.host + ")"; document.title = $("title").textContent; }
+  for (const [k, v] of [["l", s.l], ["r", s.r]]) {
+    const b = $(k + "b"), p = Math.round(v * 100);
+    b.style.left = (v >= 0 ? 50 : 50 + v * 50) + "%"; b.style.width = Math.abs(v) * 50 + "%";
+    $(k + "v").textContent = p + " %";
+  }
+  $("driver").textContent = s.driver === "you" ? "You drive." : s.driver === "other" ? `Someone else drives (${s.src}).` :
+    s.deadman ? "Stopped: the commands stopped coming." : "Nobody drives.";
+  for (const k of ["max", "accel", "trim", "min"]) if (document.activeElement !== $(k)) { $(k).value = s[k]; out(k); }
+  $("rev_left").checked = !!s.rev_left; $("rev_right").checked = !!s.rev_right;
+}
+function showWifi(j) {
+  $("wifi").textContent = `Wi-Fi: ${j.text || j.phase}${j.ssid ? ", " + j.ssid : ""}${j.rssi ? ", " + j.rssi + " dBm" : ""}${j.rtt != null ? ", ping " + j.rtt + " ms" : ""}${j.loss ? ", " + j.loss + " % lost" : ""}`;
+}
+function out(k) { const v = +$(k).value; $(k + "o").textContent = k === "trim" ? (v > 0 ? "+" : "") + v : v + " %"; }
+for (const k of ["max", "accel", "trim", "min"]) {
+  $(k).oninput = () => out(k);
+  $(k).onchange = () => send({ set: { [k]: +$(k).value } });
+}
+for (const k of ["rev_left", "rev_right"]) $(k).onchange = () => send({ set: { [k]: $(k).checked ? 1 : 0 } });
+
+// The pad: a circle; the knob follows the finger, up = forward, right = turn right.
+const pad = $("pad"), ctx = pad.getContext("2d");
+function drawPad() {
+  const w = pad.width, r = w / 2 - 10, cs = getComputedStyle(document.documentElement);
+  ctx.clearRect(0, 0, w, w);
+  ctx.beginPath(); ctx.arc(w / 2, w / 2, r, 0, 7); ctx.fillStyle = cs.getPropertyValue("--card"); ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = cs.getPropertyValue("--line"); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(w / 2, 20); ctx.lineTo(w / 2, w - 20); ctx.moveTo(20, w / 2); ctx.lineTo(w - 20, w / 2); ctx.stroke();
+  ctx.beginPath(); ctx.arc(w / 2 + cmd.x * r, w / 2 - cmd.y * r, 26, 0, 7);
+  ctx.fillStyle = padActive || keys.size ? cs.getPropertyValue("--accent") : cs.getPropertyValue("--muted"); ctx.fill();
+}
+function padAt(e) {
+  const b = pad.getBoundingClientRect(), r = b.width / 2 - 10 * b.width / pad.width;
+  let x = (e.clientX - b.left - b.width / 2) / r, y = -(e.clientY - b.top - b.height / 2) / r;
+  const m = Math.hypot(x, y); if (m > 1) { x /= m; y /= m; }
+  cmd = { x, y }; src = e.pointerType === "touch" ? "touch" : "mouse"; drawPad();
+}
+pad.addEventListener("pointerdown", (e) => { padActive = true; pad.setPointerCapture(e.pointerId); padAt(e); e.preventDefault(); });
+pad.addEventListener("pointermove", (e) => { if (padActive) padAt(e); });
+const release = () => { if (!padActive) return; padActive = false; cmd = { x: 0, y: 0 }; send({ stop: 1 }); drawPad(); };
+pad.addEventListener("pointerup", release); pad.addEventListener("pointercancel", release);
+
+const KEYMAP = { ArrowUp: "f", KeyW: "f", ArrowDown: "b", KeyS: "b", ArrowLeft: "l", KeyA: "l", ArrowRight: "r", KeyD: "r" };
+addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT") return;
+  if (e.code === "Space") { keys.clear(); cmd = { x: 0, y: 0 }; send({ stop: 1 }); drawPad(); e.preventDefault(); return; }
+  const k = KEYMAP[e.code]; if (!k) return;
+  keys.add(k); fromKeys(); e.preventDefault();
+});
+addEventListener("keyup", (e) => { const k = KEYMAP[e.code]; if (!k) return; keys.delete(k); fromKeys(); if (!keys.size) send({ stop: 1 }); });
+addEventListener("blur", () => { if (keys.size || padActive) { keys.clear(); padActive = false; cmd = { x: 0, y: 0 }; send({ stop: 1 }); drawPad(); } });
+function fromKeys() {
+  const y = (keys.has("f") ? 1 : 0) - (keys.has("b") ? 1 : 0), x = (keys.has("r") ? 1 : 0) - (keys.has("l") ? 1 : 0);
+  cmd = { x: y ? x * 0.5 : x * 0.7, y }; src = "keyboard"; drawPad();
+}
+$("stop").onclick = () => { keys.clear(); padActive = false; cmd = { x: 0, y: 0 }; send({ stop: 1 }); drawPad(); };
+
+// While the pad or a key is held: a command every 80 ms (the robot stops 0.5 s after the last one).
+setInterval(() => {
+  if ((padActive || keys.size) && Date.now() - lastSent >= 75) { send({ x: +cmd.x.toFixed(3), y: +cmd.y.toFixed(3), src }); lastSent = Date.now(); }
+}, 40);
+// A hidden tab lets go of its connection (the robot and the lab demos site take only a few): back when shown again.
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { $("stop").onclick(); if (ws) { const w = ws; ws = null; w.onclose = null; w.close(); $("conn").textContent = "paused (tab hidden)"; $("dot").className = "dot"; } }
+  else connect();
+});
+drawPad(); connect();
+</script>
+</body>
+</html>
