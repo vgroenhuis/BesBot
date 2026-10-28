@@ -1,5 +1,5 @@
 CONFIG_IDF_TARGET="esp32c5"
-CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
@@ -12,3 +12,24 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 CONFIG_LWIP_SNTP_MAX_SERVERS=2
 CONFIG_HTTPD_WS_SUPPORT=y
+# Bluetooth LE control beside Wi-Fi (closer_ble): NimBLE, peripheral only, up to 3 phones/laptops at a time.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=3
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=247
+CONFIG_BT_NIMBLE_SECURITY_ENABLE=n
+CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
+
+# UDP test (closer_udp: two UDP sockets next to the web server, heartbeats and updates)
+CONFIG_LWIP_MAX_SOCKETS=16
+
+# The N16R8 module's 8 MB PSRAM (since 1.2.0): big allocations (TLS buffers among them) go there, so internal RAM
+# stays free for Wi-Fi and Bluetooth. A board without PSRAM still starts (internal RAM only).
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+# A crash leaves a core dump in its partition (read it over USB with idf.py coredump-info)
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y

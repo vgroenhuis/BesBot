@@ -1,7 +1,8 @@
 // BesBot: a two-wheeled SmartXP robot. The ESP32-C5 drives an L298N H-bridge (IN1..IN4 with PWM; ENA and ENB are tied
 // high), from its own web page or from the lab demos site (touch, keyboard, gamepad, ATLAS, HandTool, SpaceMouse).
-// Commands come over the WebSocket /ws (or POST /api/drive) and only keep the motors running while they keep coming:
-// without a new command for DEADMAN_MS the robot stops. One driver at a time.
+// Commands come over the WebSocket /ws (or POST /api/drive), or over Bluetooth LE with an access code (since 1.1.0),
+// and only keep the motors running while they keep coming: without a new command for DEADMAN_MS the robot stops.
+// One driver at a time.
 // The on-board RGB LED is a Wi-Fi signal light (as on the Turtle). Wi-Fi, reporting to the lab demos page and
 // over-the-air updates come from the closer_demo component; the Wi-Fi meter, history, access point lists and surveys
 // are the Turtle's.
@@ -12,7 +13,10 @@
 #include <time.h>
 
 #include "cJSON.h"
+#include "closer_ble.h"
 #include "closer_demo.h"
+#include "closer_udp.h"
+#include "closer_wifi_web.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "esp_http_server.h"
@@ -35,7 +39,6 @@ extern const char page_end[] asm("_binary_page_html_end");
 static led_strip_handle_t strip;
 static uint8_t shown[3];                // what the LED shows now, in screen values (for the page)
 static uint32_t requests;
-static const bool wifi_mode = true;     // (the Turtle's switch: here the LED is always the signal light)
 static int brightness = CONFIG_BESBOT_BRIGHTNESS;
 
 #define MAX_CLIENTS 16
@@ -117,6 +120,11 @@ static struct {
     bool stopped_by_deadman;
 } D = {.owner = -1};
 #define OWNER_HTTP (-2)
+#define OWNER_BLE 1000           // + the Bluetooth connection handle (WebSocket fds are small numbers)
+
+// The Bluetooth access code: 6-32 characters, set by an admin (POST /api/settings or {"set":{"ble_code":..}} on /ws,
+// both admin-only through the lab demos site). "" = no driving over Bluetooth (stopping is always allowed).
+static char ble_code[33];
 
 static void settings_load(void) {
     nvs_handle_t h;
@@ -124,6 +132,8 @@ static void settings_load(void) {
     settings_t s;
     if (nvs_open("besbot", NVS_READONLY, &h) == ESP_OK) {
         if (nvs_get_blob(h, "settings", &s, &len) == ESP_OK && len == sizeof s) cfg = s;
+        len = sizeof ble_code;
+        if (nvs_get_str(h, "ble_code", ble_code, &len) != ESP_OK) ble_code[0] = 0;
         nvs_close(h);
     }
 }
@@ -132,6 +142,7 @@ static void settings_save(void) {
     nvs_handle_t h;
     if (nvs_open("besbot", NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_blob(h, "settings", &cfg, sizeof cfg);
+        nvs_set_str(h, "ble_code", ble_code);
         nvs_commit(h);
         nvs_close(h);
     }
@@ -246,14 +257,16 @@ static int drive_json(char *out, size_t len, int viewer) {
     float x = D.x, y = D.y, l = D.out[0], r = D.out[1];
     char src[16];
     strlcpy(src, D.src, sizeof src);
-    bool dm = D.stopped_by_deadman;
+    bool dm = D.stopped_by_deadman, ble_driver = owned && D.owner >= OWNER_BLE;
     uint32_t refused = D.refused, stops = D.deadman_stops;
     portEXIT_CRITICAL(&drive_mux);
     return snprintf(out, len, "{\"drive\":1,\"x\":%.2f,\"y\":%.2f,\"l\":%.2f,\"r\":%.2f,\"src\":\"%s\",\"driver\":\"%s\","
-                    "\"deadman\":%s,\"deadman_stops\":%lu,\"refused\":%lu,\"max\":%u,\"accel\":%u,\"trim\":%d,\"rev_left\":%u,"
-                    "\"rev_right\":%u,\"min\":%u,\"fw\":\"%s\",\"host\":\"%s\"}",
-                    x, y, l, r, src, who, dm ? "true" : "false", (unsigned long)stops, (unsigned long)refused, cfg.max_pct,
-                    cfg.accel_pct, cfg.trim, cfg.rev_left, cfg.rev_right, cfg.min_pct, closer_demo_version(), closer_demo_name());
+                    "\"via\":\"%s\",\"deadman\":%s,\"deadman_stops\":%lu,\"refused\":%lu,\"max\":%u,\"accel\":%u,\"trim\":%d,"
+                    "\"rev_left\":%u,\"rev_right\":%u,\"min\":%u,\"ble\":%d,\"ble_code\":%s,\"fw\":\"%s\",\"host\":\"%s\"}",
+                    x, y, l, r, src, who, ble_driver ? "bluetooth" : "wifi", dm ? "true" : "false", (unsigned long)stops,
+                    (unsigned long)refused, cfg.max_pct, cfg.accel_pct, cfg.trim, cfg.rev_left, cfg.rev_right, cfg.min_pct,
+                    closer_ble_running() ? closer_ble_connections() : -1, ble_code[0] ? "true" : "false",
+                    closer_demo_version(), closer_demo_name());
 }
 
 // ------------------------------------------------------------------ Wi-Fi signal light
@@ -651,7 +664,8 @@ static esp_err_t history_get(httpd_req_t *req) {
 // ------------------------------------------------------------------ access points around (a survey every 30 s)
 
 #define SURVEY_MAX 60
-#define SURVEY_EVERY_S 30
+#define SURVEY_GOOD_S 300           // between scans while the signal is good (-65 dBm or better)
+#define SURVEY_WEAK_S 60
 static wifi_ap_record_t survey[SURVEY_MAX];
 static uint16_t survey_n;
 static int64_t survey_ms;            // uptime of the last survey, 0 never
@@ -686,7 +700,9 @@ static int aps_json(char *out, size_t len) {
     return n;
 }
 
+static int64_t aps_asked_ms;         // when the access point list was last asked for (uptime)
 static esp_err_t aps_get(httpd_req_t *req) {
+    aps_asked_ms = esp_timer_get_time() / 1000;
     char *out = malloc(SURVEY_MAX * 150 + 100);
     if (!out) return httpd_resp_send_500(req);
     int n = aps_json(out, SURVEY_MAX * 150 + 100);
@@ -933,11 +949,12 @@ static esp_err_t survey_handler(httpd_req_t *req) {
     return httpd_resp_sendstr(req, out);
 }
 
-// Scans: every SURVEY_EVERY_S while the LED shows the signal or someone watches the stream, and at the survey's
-// interval while a survey runs (a scan delays traffic a little).
+// Scans while someone looks at the access point list (the stream, /api/wifi/aps in the last 2 minutes): every
+// SURVEY_GOOD_S on a good signal, SURVEY_WEAK_S on a weak one; and at the survey's interval while a survey runs.
+// (As on the Turtle since 1.14.3; before 1.2.0 the BesBot scanned every 30 s whatever happened.)
 static void survey_task(void *arg) {
     static wifi_ap_record_t recs[SURVEY_MAX];
-    int64_t last = -SURVEY_EVERY_S * 1000LL;
+    int64_t last = -SURVEY_GOOD_S * 1000LL;
     bool resume = true;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -949,10 +966,18 @@ static void survey_task(void *arg) {
             ESP_LOGI(TAG, "Survey %lu done: %lu scans", (unsigned long)SV.session, (unsigned long)SV.seq);
         }
         if (SV.backlog_n) sv_flush();
-        int every = SV.active ? SV.interval_s : SURVEY_EVERY_S;
-        bool wanted = SV.active || wifi_mode || stream_has_viewers();
+        // A full scan delays traffic for a few seconds. A robot with a good signal has little to learn from it: every
+        // 5 minutes then, every minute while the signal is weak (a survey session: its own pace).
+        wifi_ap_record_t ap;
+        bool good = esp_wifi_sta_get_ap_info(&ap) == ESP_OK && ap.rssi >= -65;
+        int every = SV.active ? SV.interval_s : good ? SURVEY_GOOD_S : SURVEY_WEAK_S;
+        bool wanted = SV.active || stream_has_viewers() || (aps_asked_ms && now - aps_asked_ms < 120000);
         if (now - last < every * 1000LL || !wanted || !closer_demo_wifi_connected()) continue;
         if (driving_recently()) continue;          // (a scan holds up the commands for seconds: not while driving)
+        // Nor while someone is connected over Bluetooth: with Bluetooth on, a scan takes ~10 s with the driver's
+        // default times, and holds the one radio all that time (the Bluetooth connection stalls). A survey session
+        // goes on: it was started on purpose.
+        if (closer_ble_connections() > 0 && !SV.active) continue;
         uint16_t n = SURVEY_MAX;
         if (closer_demo_scan_all(recs, &n) != ESP_OK) { last = now - (every - 5) * 1000LL; continue; }   // busy: in 5 s
         last = now;                                   // (the interval runs from start to start: a full scan takes ~10 s)
@@ -970,6 +995,114 @@ static void survey_task(void *arg) {
             sv_flush();
         }
     }
+}
+
+// ------------------------------------------------------------------ Bluetooth
+// The /ws commands over Bluetooth LE (closer_ble), for places where the Wi-Fi is poor: a phone or laptop next to the
+// robot drives it directly. Anyone in range may connect and stop the robot; driving and settings need the access code
+// first: "code:<code>" -> {"auth":1} or {"auth":0}. A wrong code makes every connection wait 2 s before the next try
+// (6 characters at least: guessing takes weeks). Each connection drives as OWNER_BLE + its handle, and gets its own
+// state 10 times a second while the robot moves (once a second otherwise), short enough for one notification:
+// {"drive":1,"l":..,"r":..,"driver":"you"|"other"|"none","src":..,"deadman":..,"max":..,"auth":0|1,"code":0|1}.
+// "ping:x" comes back as "pong:x" (round-trip test). Losing the connection stops the robot at once if it drove.
+
+#define BLE_SLOTS 3
+static void settings_from(cJSON *j);
+static struct { int conn; bool authed; } ble_slots[BLE_SLOTS] = {{-1, false}, {-1, false}, {-1, false}};
+static int64_t ble_code_wait_us;             // no code checks before this (after a wrong one)
+static portMUX_TYPE ble_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static bool ble_authed(int conn) {
+    bool a = false;
+    portENTER_CRITICAL(&ble_mux);
+    for (int i = 0; i < BLE_SLOTS; i++) if (ble_slots[i].conn == conn) a = ble_slots[i].authed;
+    portEXIT_CRITICAL(&ble_mux);
+    return a && ble_code[0];                  // (switching the code off ends every session)
+}
+
+static void ble_set_authed(int conn) {
+    portENTER_CRITICAL(&ble_mux);
+    int k = -1;
+    for (int i = 0; i < BLE_SLOTS; i++) if (ble_slots[i].conn == conn) k = i;
+    for (int i = 0; i < BLE_SLOTS && k < 0; i++) if (ble_slots[i].conn < 0) k = i;
+    if (k >= 0) ble_slots[k].conn = conn, ble_slots[k].authed = true;
+    portEXIT_CRITICAL(&ble_mux);
+}
+
+static int ble_state_json(char *out, size_t len, int conn) {
+    portENTER_CRITICAL(&drive_mux);
+    bool owned = D.owner != -1 && esp_timer_get_time() - D.owner_us < LEASE_MS * 1000LL;
+    const char *who = !owned ? "none" : D.owner == OWNER_BLE + conn ? "you" : "other";
+    float l = D.out[0], r = D.out[1];
+    char src[16];
+    strlcpy(src, D.src, sizeof src);
+    bool dm = D.stopped_by_deadman;
+    portEXIT_CRITICAL(&drive_mux);
+    return snprintf(out, len, "{\"drive\":1,\"l\":%.2f,\"r\":%.2f,\"driver\":\"%s\",\"src\":\"%s\",\"deadman\":%d,\"max\":%u,"
+                    "\"auth\":%d,\"code\":%d}", l, r, who, src, dm, cfg.max_pct, ble_authed(conn), ble_code[0] != 0);
+}
+
+static void ble_send_state(int conn) {
+    char buf[176];
+    ble_state_json(buf, sizeof buf, conn);
+    closer_ble_notify(conn, buf);
+}
+
+static bool ble_code_ok(const char *given) {
+    // The same time whatever matches (no hint from how long the check takes).
+    size_t n = strlen(ble_code), m = strlen(given);
+    unsigned diff = n != m;
+    for (size_t i = 0; i < n; i++) diff |= (unsigned char)ble_code[i] ^ (unsigned char)(i < m ? given[i] : 0);
+    return n && !diff;
+}
+
+// In the Bluetooth task.
+static void ble_command(int conn, const char *text) {
+    requests++;
+    if (strncmp(text, "ping:", 5) == 0) {
+        char pong[72];
+        snprintf(pong, sizeof pong, "pong:%s", text + 5);
+        closer_ble_notify(conn, pong);
+        return;
+    }
+    if (strncmp(text, "code:", 5) == 0) {
+        int64_t now = esp_timer_get_time();
+        bool ok = false, waited = now >= ble_code_wait_us;
+        if (waited) {
+            ok = ble_code_ok(text + 5);
+            if (ok) ble_set_authed(conn);
+            else ble_code_wait_us = now + 2000 * 1000LL;
+        }
+        ESP_LOGI(TAG, "Bluetooth %d: code %s", conn, ok ? "accepted" : waited ? "wrong" : "too soon");
+        closer_ble_notify(conn, ok ? "{\"auth\":1}" : waited ? "{\"auth\":0}" : "{\"auth\":0,\"wait\":1}");
+        if (ok) ble_send_state(conn);
+        return;
+    }
+    if (strcmp(text, "state") == 0) { ble_send_state(conn); return; }
+    cJSON *j = cJSON_Parse(text);
+    if (!j) return;
+    cJSON *x = cJSON_GetObjectItem(j, "x"), *y = cJSON_GetObjectItem(j, "y"), *src = cJSON_GetObjectItem(j, "src"),
+          *set = cJSON_GetObjectItem(j, "set");
+    if (cJSON_GetObjectItem(j, "stop")) {
+        drive_command(OWNER_BLE + conn, 0, 0, NULL);           // anyone may stop it
+    } else if (!ble_authed(conn)) {
+        closer_ble_notify(conn, ble_code[0] ? "{\"auth\":0,\"need\":1}" : "{\"auth\":0,\"nocode\":1}");
+    } else if (cJSON_IsObject(set)) {
+        cJSON_DeleteItemFromObject(set, "ble_code");           // the code is changed through the site only
+        settings_from(set);
+    } else if (cJSON_IsNumber(x) && cJSON_IsNumber(y)) {
+        if (!drive_command(OWNER_BLE + conn, (float)x->valuedouble, (float)y->valuedouble,
+                           cJSON_IsString(src) ? src->valuestring : "ble"))
+            closer_ble_notify(conn, "{\"busy\":1}");
+    }
+    cJSON_Delete(j);
+}
+
+static void ble_gone(int conn) {
+    drive_client_gone(OWNER_BLE + conn);
+    portENTER_CRITICAL(&ble_mux);
+    for (int i = 0; i < BLE_SLOTS; i++) if (ble_slots[i].conn == conn) ble_slots[i].conn = -1, ble_slots[i].authed = false;
+    portEXIT_CRITICAL(&ble_mux);
 }
 
 // ------------------------------------------------------------------ live stream on /ws
@@ -1046,8 +1179,8 @@ static void wifi_task(void *arg) {
     }
 }
 
-// The drive state to every stream viewer (each learns whether it is the driver): 10 a second while anything moves
-// or a driver holds the robot, otherwise once a second.
+// The drive state to every stream viewer and Bluetooth connection (each learns whether it is the driver): 10 a second
+// while anything moves or a driver holds the robot, otherwise once a second.
 static void drive_stream_task(void *arg) {
     int64_t last = 0;
     for (;;) {
@@ -1061,7 +1194,7 @@ static void drive_stream_task(void *arg) {
         for (int i = 0; i < MAX_STREAMS; i++) if (stream_fds[i] >= 0) fds[count++] = stream_fds[i];
         portEXIT_CRITICAL(&stream_mux);
         for (int k = 0; k < count && server; k++) {
-            char buf[384];
+            char buf[480];
             int n = drive_json(buf, sizeof buf, fds[k]);
             httpd_ws_frame_t frame = {.type = HTTPD_WS_TYPE_TEXT, .payload = (uint8_t *)buf, .len = n};
             if (httpd_ws_get_fd_info(server, fds[k]) != HTTPD_WS_CLIENT_WEBSOCKET || ws_send(fds[k], &frame) != ESP_OK) {
@@ -1070,6 +1203,8 @@ static void drive_stream_task(void *arg) {
                 portEXIT_CRITICAL(&stream_mux);
             }
         }
+        int conns[BLE_SLOTS];
+        for (int k = 0, n = closer_ble_conn_handles(conns, BLE_SLOTS); k < n; k++) ble_send_state(conns[k]);
     }
 }
 
@@ -1123,12 +1258,12 @@ static esp_err_t drive_http(httpd_req_t *req) {
             }
         }
     }
-    char out[384];
+    char out[480];
     drive_json(out, sizeof out, OWNER_HTTP);
     return send_json(req, out);
 }
 
-// Settings from JSON: {"max":60,"accel":25,"trim":0,"rev_left":0,"rev_right":0,"min":30}; any subset.
+// Settings from JSON: {"max":60,"accel":25,"trim":0,"rev_left":0,"rev_right":0,"min":30,"ble_code":"..."}; any subset.
 static void settings_from(cJSON *j) {
     cJSON *v;
     if ((v = cJSON_GetObjectItem(j, "max")) && cJSON_IsNumber(v) && v->valueint >= 10 && v->valueint <= 100) cfg.max_pct = v->valueint;
@@ -1137,6 +1272,15 @@ static void settings_from(cJSON *j) {
     if ((v = cJSON_GetObjectItem(j, "rev_left")) && cJSON_IsNumber(v)) cfg.rev_left = v->valueint != 0;
     if ((v = cJSON_GetObjectItem(j, "rev_right")) && cJSON_IsNumber(v)) cfg.rev_right = v->valueint != 0;
     if ((v = cJSON_GetObjectItem(j, "min")) && cJSON_IsNumber(v) && v->valueint >= 0 && v->valueint <= 60) cfg.min_pct = v->valueint;
+    if ((v = cJSON_GetObjectItem(j, "ble_code")) && cJSON_IsString(v)) {
+        size_t n = strlen(v->valuestring);
+        if ((n == 0 || (n >= 6 && n < sizeof ble_code)) && strcmp(ble_code, v->valuestring) != 0) {
+            strlcpy(ble_code, v->valuestring, sizeof ble_code);
+            portENTER_CRITICAL(&ble_mux);        // a new code: everyone gives it again
+            for (int i = 0; i < BLE_SLOTS; i++) ble_slots[i].authed = false;
+            portEXIT_CRITICAL(&ble_mux);
+        }
+    }
     settings_save();
 }
 
@@ -1155,7 +1299,7 @@ static esp_err_t settings_post(httpd_req_t *req) {
     if (!j) { httpd_resp_set_status(req, "400 Bad Request"); return send_json(req, "{\"error\":\"JSON expected\"}"); }
     settings_from(j);
     cJSON_Delete(j);
-    char out[384];
+    char out[480];
     drive_json(out, sizeof out, OWNER_HTTP);
     return send_json(req, out);
 }
@@ -1203,7 +1347,7 @@ static void web_start(void) {
     httpd_config_t c = HTTPD_DEFAULT_CONFIG();
     c.lru_purge_enable = true;
     c.stack_size = 6144;
-    c.max_uri_handlers = 14;
+    c.max_uri_handlers = 18;       // (16 in use: 10 here, 3 for the Wi-Fi settings page, 3 for the UDP test)
     c.send_wait_timeout = 2;       // a stalled viewer must not hold the others up for long
     c.close_fn = on_close;
     httpd_handle_t srv;
@@ -1222,6 +1366,8 @@ static void web_start(void) {
         {.uri = "/ws", .method = HTTP_GET, .handler = ws_handler, .is_websocket = true},
     };
     for (int i = 0; i < sizeof uris / sizeof uris[0]; i++) httpd_register_uri_handler(srv, &uris[i]);
+    closer_wifi_web_register(srv);   // since 1.1.0: /wifi, networks, band, access point, roaming, Bluetooth on/off
+    closer_udp_register(srv);        // since 1.1.0: /udp, round trips to the CloSer server
 }
 
 void app_main(void) {
@@ -1242,5 +1388,7 @@ void app_main(void) {
     xTaskCreate(drive_stream_task, "drive-live", 4096, NULL, 3, NULL);
     xTaskCreate(survey_task, "survey", 8192, NULL, 2, NULL);      // (it also uploads: TLS)
     xTaskCreate(stats_task, "stats", 3072, NULL, 2, NULL);
+    closer_ble_set_conn_handlers(ble_command, ble_gone);
+    closer_ble_start("besbot", NULL);   // since 1.1.0: drive from a phone or laptop nearby, with the access code
     ESP_LOGI(TAG, "BesBot running, firmware %s", closer_demo_version());
 }
