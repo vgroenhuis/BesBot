@@ -21,6 +21,7 @@
   .bar b { position:absolute; top:0; bottom:0; left:50%; background:var(--accent); }
   .muted { color:var(--muted); font-size:.88rem; }
   button { font:inherit; padding:8px 16px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--fg); cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
   button.stop { background:var(--bad); color:#fff; border-color:var(--bad); font-weight:600; padding:10px 22px; }
   label { display:flex; align-items:center; gap:8px; }
   input[type=range] { flex:1; min-width:120px; }
@@ -29,6 +30,9 @@
   .set label span:first-child { min-width:9em; }
   .set output { min-width:3.5em; text-align:right; font-variant-numeric:tabular-nums; }
   a { color:var(--accent); }
+  .ctl { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .ctl input { font:inherit; width:7em; padding:7px 10px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--fg); letter-spacing:.2em; }
+  .locked canvas, .locked .set { opacity:.45; pointer-events:none; }
 </style>
 </head>
 <body>
@@ -36,6 +40,18 @@
 <p class="sub">Drive with the pad (touch or mouse) or the keyboard: arrow keys or W A S D, space to stop. The robot stops by itself when the commands stop coming.</p>
 
 <div class="card">
+  <div class="ctl">
+    <b id="ctlstate">Watching</b>
+    <span style="flex:1"></span>
+    <button class="primary" id="ctlask">Ask for control</button>
+    <input id="ctlcode" inputmode="numeric" autocomplete="one-time-code" maxlength="8" placeholder="code" hidden>
+    <button class="primary" id="ctlsend" hidden>OK</button>
+    <button id="ctlrelease" hidden>Release</button>
+  </div>
+  <p class="muted" id="ctlmsg" style="margin:6px 0 0">One person controls the robot at a time; everyone can watch. To drive, ask for control and type the code the robot shows. Stop works for everyone.</p>
+</div>
+
+<div class="card" id="drivecard">
   <div class="row">
     <span><span id="dot" class="dot"></span><span id="conn">connecting…</span></span>
     <span id="driver" class="muted"></span>
@@ -50,7 +66,7 @@
   <p class="muted" id="wifi" style="margin:10px 0 0"></p>
 </div>
 
-<div class="card">
+<div class="card" id="setcard">
   <details>
     <summary>Settings</summary>
     <div class="set">
@@ -64,11 +80,35 @@
     </div>
   </details>
 </div>
+<div class="card">
+  <div class="row" style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
+    <span>Firmware <b id="fwver">…</b></span>
+    <button class="primary" id="fwcheck">Check for updates</button>
+    <span class="muted" id="fwnote"></span>
+  </div>
+</div>
 <p class="muted">More ways to drive (gamepad, SpaceMouse, HandTool, ATLAS), the Wi-Fi history and the robot's status: <a href="https://closer.ram.eemcs.utwente.nl/labdemos/demo?id=besbot">the lab demos page</a>.</p>
 
 <script>
 const $ = (id) => document.getElementById(id);
-let ws = null, state = {}, cmd = { x: 0, y: 0 }, src = "touch", lastSent = 0, padActive = false, keys = new Set();
+// Firmware: "Check for updates" asks the robot to report to the lab demos site now; it installs what the site offers.
+async function fwState(post) {
+  try {
+    const r = await fetch("api/update", { method: post ? "POST" : "GET", cache: "no-store" });
+    const u = await r.json();
+    $("fwver").textContent = u.version;
+    const waiting = u.checking;
+    $("fwnote").textContent = u.installing ? `Installing ${u.offered || "an update"}: the robot restarts when it is done (about a minute).` :
+      waiting ? "Asking the lab demos site…" :
+      u.offered ? `Version ${u.offered} is available${u.note ? " (" + u.note + ")" : ""}.` :
+      u.checked_s >= 0 ? `Up to date (checked ${u.checked_s < 60 ? u.checked_s + " s" : Math.round(u.checked_s / 60) + " min"} ago).` :
+      "Not in touch with the lab demos site yet.";
+    $("fwcheck").disabled = u.installing || waiting;
+  } catch (e) { $("fwnote").textContent = "The robot doesn't answer (restarting?)."; }
+}
+$("fwcheck").onclick = () => fwState(true);
+fwState(false); setInterval(() => fwState(false), 2000);
+let ws = null, state = {}, ctl = { token: "", msg: "" }, cmd = { x: 0, y: 0 }, src = "touch", lastSent = 0, padActive = false, keys = new Set();
 
 function wsUrl() {
   let u = new URL("ws", location.href);
@@ -82,7 +122,11 @@ function adminToken() {
 function connect() {
   if (document.hidden || ws) return;
   ws = new WebSocket(wsUrl());
-  ws.onopen = () => { const t = adminToken(); if (t) ws.send(JSON.stringify({ admin_token: t })); ws.send("stream"); $("conn").textContent = "connected"; $("dot").className = "dot ok"; };
+  ws.onopen = () => {
+    const t = adminToken(); if (t) ws.send(JSON.stringify({ admin_token: t }));
+    ws.send("stream"); $("conn").textContent = "connected"; $("dot").className = "dot ok";
+    const k = savedToken(); if (k) send({ access: "token", token: k });       // back after a reconnect: control too
+  };
   ws.onclose = (ev) => {
     $("dot").className = "dot bad";
     $("conn").textContent = ev.code === 4401 ? "driving through this site needs the admin login (lab demos page)" :
@@ -92,11 +136,45 @@ function connect() {
   ws.onmessage = (ev) => {
     let j; try { j = JSON.parse(ev.data); } catch (e) { return; }
     if (j.busy) { $("driver").textContent = "Someone else is driving: wait until they stop."; return; }
-    if (j.drive) { state = j; showDrive(); }
+    if (j.need) { ctl.msg = "You don't have control (any more): ask for it again."; showCtl(); return; }
+    if (j.access && !j.drive) { onAccess(j); return; }
+    if (j.drive) { state = j; showDrive(); showCtl(); }
     else if (j.wifi) showWifi(j);
   };
 }
 function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+
+// Control: one person at a time (the robot shows a code on its display; the lab demos site's page also takes the QR code).
+const savedToken = () => { try { return sessionStorage.getItem("besbotAccess") || ""; } catch (e) { return ""; } };
+const saveToken = (t) => { try { t ? sessionStorage.setItem("besbotAccess", t) : sessionStorage.removeItem("besbotAccess"); } catch (e) {} };
+const ASK = { shown: "Type the code the robot shows.", wrong: "Wrong code: try again.", expired: "That code is no longer valid: ask again.",
+              released: "You released control.", busy: "Someone else has control.", denied: "Not allowed." };
+function onAccess(j) {
+  if (j.access === "granted") { saveToken(j.token); ctl.msg = ""; $("ctlcode").value = ""; }
+  else if (j.access === "wait") ctl.msg = `Wait ${j.for} s before trying again.`;
+  else { ctl.msg = ASK[j.access] || ""; if (j.access === "expired" || j.access === "released") saveToken(""); }
+  if (j.access === "shown") { ctl.asked = true; setTimeout(() => $("ctlcode").focus(), 0); }
+  showCtl();
+}
+let hadControl = false;
+function showCtl() {
+  const a = state.access, mine = a === "you";
+  if (hadControl && !mine) { ctl.msg = a === "other" ? "Someone else took control (with the code on the robot)." : "Control ended (10 minutes without driving, or released)."; saveToken(""); }
+  hadControl = mine;
+  if (!state.code) ctl.asked = false;
+  $("ctlstate").textContent = mine ? "You have control" : a === "other" ? "Someone else has control" : "Watching";
+  $("ctlask").hidden = mine; $("ctlask").textContent = state.code ? "New code" : "Ask for control";
+  $("ctlcode").hidden = $("ctlsend").hidden = mine || !(state.code || ctl.asked);
+  $("ctlrelease").hidden = !mine;
+  $("ctlmsg").textContent = ctl.msg || (mine ? "You can drive and change the settings. Control ends when you release it, close the page, or after 10 minutes without driving." :
+    state.code ? `A code is on the robot's display for ${state.code} s more.` :
+    "One person controls the robot at a time; everyone can watch. To drive, ask for control and type the code the robot shows. Stop works for everyone.");
+  $("drivecard").classList.toggle("locked", !mine); $("setcard").classList.toggle("locked", !mine);
+}
+$("ctlask").onclick = () => { ctl.msg = ""; send({ access: "request" }); };
+$("ctlsend").onclick = () => { const c = $("ctlcode").value.replace(/\D/g, ""); if (c.length >= 2) send({ access: "code", code: c }); };
+$("ctlcode").addEventListener("keydown", (e) => { if (e.key === "Enter") $("ctlsend").onclick(); });
+$("ctlrelease").onclick = () => { $("stop").onclick(); send({ access: "release" }); };
 
 function showDrive() {
   const s = state;
@@ -167,7 +245,7 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) { $("stop").onclick(); if (ws) { const w = ws; ws = null; w.onclose = null; w.close(); $("conn").textContent = "paused (tab hidden)"; $("dot").className = "dot"; } }
   else connect();
 });
-drawPad(); connect();
+drawPad(); showCtl(); connect();
 </script>
 </body>
 </html>

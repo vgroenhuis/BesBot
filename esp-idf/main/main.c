@@ -13,6 +13,8 @@
 #include <time.h>
 
 #include "cJSON.h"
+#include "closer_access.h"
+#include "display.h"
 #include "closer_ble.h"
 #include "closer_demo.h"
 #include "closer_udp.h"
@@ -105,7 +107,7 @@ typedef struct {
     uint8_t rev_left, rev_right;
     uint8_t min_pct;         // below this duty the motors only hum: commands under it start at it (0: off)
 } settings_t;
-static settings_t cfg = {.max_pct = CONFIG_BESBOT_MAX_PCT, .accel_pct = 25, .trim = 0, .min_pct = 30};
+static settings_t cfg = {.max_pct = CONFIG_BESBOT_MAX_PCT, .accel_pct = 25, .trim = 0, .min_pct = 10};
 
 static portMUX_TYPE drive_mux = portMUX_INITIALIZER_UNLOCKED;
 static struct {
@@ -134,6 +136,27 @@ static void settings_load(void) {
         if (nvs_get_blob(h, "settings", &s, &len) == ESP_OK && len == sizeof s) cfg = s;
         len = sizeof ble_code;
         if (nvs_get_str(h, "ble_code", ble_code, &len) != ESP_OK) ble_code[0] = 0;
+        nvs_close(h);
+    }
+    // Once each: a saved old default becomes the new one (top speed 70 -> 100 % in 1.5.1, minimum power 30 -> 10 %
+    // in 1.6.4, so it can drive very slowly).
+    uint8_t done = 0;
+    if (nvs_open("besbot", NVS_READWRITE, &h) == ESP_OK) {
+        bool changed = false;
+        if (nvs_get_u8(h, "max100", &done) != ESP_OK) {
+            if (cfg.max_pct == 70) cfg.max_pct = 100;
+            nvs_set_u8(h, "max100", 1);
+            changed = true;
+        }
+        if (nvs_get_u8(h, "min10", &done) != ESP_OK) {
+            if (cfg.min_pct == 30) cfg.min_pct = 10;
+            nvs_set_u8(h, "min10", 1);
+            changed = true;
+        }
+        if (changed) {
+            nvs_set_blob(h, "settings", &cfg, sizeof cfg);
+            nvs_commit(h);
+        }
         nvs_close(h);
     }
 }
@@ -177,12 +200,20 @@ static void motor_write(int side, float v) {
 
 static float clamp1(float v) { return v < -1 ? -1 : v > 1 ? 1 : v; }
 
-// A command from a driver: false when someone else drives (the robot stays theirs until LEASE_MS after their last
-// moving command). A stop is always accepted.
+// A command from a driver: false when it may not drive. Moving needs control (closer_access: the code from the robot,
+// or the site's grant); a stop is always accepted, from anyone. (Within control, the old lease rule stays: the robot is
+// the last mover's until LEASE_MS after its last moving command; it matters only to the stop from someone else.)
 static bool drive_command(int who, float x, float y, const char *src) {
     if (isnan(x) || isnan(y)) return false;
     x = clamp1(x), y = clamp1(y);
     bool moving = fabsf(x) > 0.02f || fabsf(y) > 0.02f;
+    if (moving && !closer_access_has(who)) {
+        portENTER_CRITICAL(&drive_mux);
+        D.refused++;
+        portEXIT_CRITICAL(&drive_mux);
+        return false;
+    }
+    if (moving) closer_access_used(who);
     int64_t now = esp_timer_get_time();
     bool ok = true;
     portENTER_CRITICAL(&drive_mux);
@@ -211,6 +242,14 @@ static bool drive_command(int who, float x, float y, const char *src) {
 static void drive_client_gone(int fd) {
     portENTER_CRITICAL(&drive_mux);
     if (D.owner == fd) { D.x = D.y = D.target[0] = D.target[1] = 0; D.owner = -1; }
+    portEXIT_CRITICAL(&drive_mux);
+}
+
+// Control moved to someone else (or ended): stop, whoever drove.
+static void access_changed(int from, int to) {
+    portENTER_CRITICAL(&drive_mux);
+    D.x = D.y = D.target[0] = D.target[1] = 0;
+    D.owner = -1;
     portEXIT_CRITICAL(&drive_mux);
 }
 
@@ -248,7 +287,17 @@ static void control_task(void *arg) {
     }
 }
 
-// {"drive":1,"x","y","l","r","src","driver":"you"|"other"|"none","max",...}: for the pages (10 a second while moving).
+// For the display: the motors' outputs and whether the driver is on Bluetooth.
+static void display_drive(float *left, float *right, bool *bluetooth) {
+    portENTER_CRITICAL(&drive_mux);
+    *left = D.out[0];
+    *right = D.out[1];
+    *bluetooth = D.owner >= OWNER_BLE;
+    portEXIT_CRITICAL(&drive_mux);
+}
+
+// {"drive":1,"x","y","l","r","src","driver":"you"|"other"|"none","access":"you"|"other"|"none","code":seconds the
+// control code is still shown (0: none),"max",...,"display":"ssd1306 0x3c" or ""}: for the pages (10 a second while moving).
 static int drive_json(char *out, size_t len, int viewer) {
     portENTER_CRITICAL(&drive_mux);
     int64_t now = esp_timer_get_time();
@@ -260,13 +309,15 @@ static int drive_json(char *out, size_t len, int viewer) {
     bool dm = D.stopped_by_deadman, ble_driver = owned && D.owner >= OWNER_BLE;
     uint32_t refused = D.refused, stops = D.deadman_stops;
     portEXIT_CRITICAL(&drive_mux);
-    return snprintf(out, len, "{\"drive\":1,\"x\":%.2f,\"y\":%.2f,\"l\":%.2f,\"r\":%.2f,\"src\":\"%s\",\"driver\":\"%s\","
+    return snprintf(out, len, "{\"drive\":1,\"access\":\"%s\",\"code\":%d,"
+                    "\"x\":%.2f,\"y\":%.2f,\"l\":%.2f,\"r\":%.2f,\"src\":\"%s\",\"driver\":\"%s\","
                     "\"via\":\"%s\",\"deadman\":%s,\"deadman_stops\":%lu,\"refused\":%lu,\"max\":%u,\"accel\":%u,\"trim\":%d,"
-                    "\"rev_left\":%u,\"rev_right\":%u,\"min\":%u,\"ble\":%d,\"ble_code\":%s,\"fw\":\"%s\",\"host\":\"%s\"}",
+                    "\"rev_left\":%u,\"rev_right\":%u,\"min\":%u,\"ble\":%d,\"ble_code\":%s,\"fw\":\"%s\",\"host\":\"%s\",\"display\":\"%s\"}",
+                    closer_access_state(viewer), closer_access_code(NULL, 0, NULL, 0),
                     x, y, l, r, src, who, ble_driver ? "bluetooth" : "wifi", dm ? "true" : "false", (unsigned long)stops,
                     (unsigned long)refused, cfg.max_pct, cfg.accel_pct, cfg.trim, cfg.rev_left, cfg.rev_right, cfg.min_pct,
                     closer_ble_running() ? closer_ble_connections() : -1, ble_code[0] ? "true" : "false",
-                    closer_demo_version(), closer_demo_name());
+                    closer_demo_version(), closer_demo_name(), display_found());
 }
 
 // ------------------------------------------------------------------ Wi-Fi signal light
@@ -579,6 +630,17 @@ static int wifi_json(char *out, size_t len) {
 static esp_err_t wifi_get(httpd_req_t *req) {
     char out[512];
     wifi_json(out, sizeof out);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(req, out);
+}
+
+// GET /api/update: the firmware and the site's last answer (closer_demo_update_json); POST: check now (the button on
+// the page; installs only what the site offers, and not while someone drives).
+static esp_err_t update_handler(httpd_req_t *req) {
+    if (req->method == HTTP_POST) closer_demo_check_update();
+    char out[320];
+    closer_demo_update_json(out, sizeof out);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_sendstr(req, out);
@@ -966,7 +1028,7 @@ static void survey_task(void *arg) {
             ESP_LOGI(TAG, "Survey %lu done: %lu scans", (unsigned long)SV.session, (unsigned long)SV.seq);
         }
         if (SV.backlog_n) sv_flush();
-        // A full scan delays traffic for a few seconds. A robot with a good signal has little to learn from it: every
+        // A full scan (one channel at a time since 1.6.0) still delays traffic a little now and then. A robot with a good signal has little to learn from it: every
         // 5 minutes then, every minute while the signal is weak (a survey session: its own pace).
         wifi_ap_record_t ap;
         bool good = esp_wifi_sta_get_ap_info(&ap) == ESP_OK && ap.rssi >= -65;
@@ -980,7 +1042,7 @@ static void survey_task(void *arg) {
         if (closer_ble_connections() > 0 && !SV.active) continue;
         uint16_t n = SURVEY_MAX;
         if (closer_demo_scan_all(recs, &n) != ESP_OK) { last = now - (every - 5) * 1000LL; continue; }   // busy: in 5 s
-        last = now;                                   // (the interval runs from start to start: a full scan takes ~10 s)
+        last = now;                                   // (the interval runs from start to start: a full scan takes ~20 s)
         xSemaphoreTake(survey_lock, portMAX_DELAY);
         memcpy(survey, recs, n * sizeof recs[0]);
         survey_n = n;
@@ -999,35 +1061,20 @@ static void survey_task(void *arg) {
 
 // ------------------------------------------------------------------ Bluetooth
 // The /ws commands over Bluetooth LE (closer_ble), for places where the Wi-Fi is poor: a phone or laptop next to the
-// robot drives it directly. Anyone in range may connect and stop the robot; driving and settings need the access code
-// first: "code:<code>" -> {"auth":1} or {"auth":0}. A wrong code makes every connection wait 2 s before the next try
-// (6 characters at least: guessing takes weeks). Each connection drives as OWNER_BLE + its handle, and gets its own
-// state 10 times a second while the robot moves (once a second otherwise), short enough for one notification:
-// {"drive":1,"l":..,"r":..,"driver":"you"|"other"|"none","src":..,"deadman":..,"max":..,"auth":0|1,"code":0|1}.
+// robot drives it directly. Anyone in range may connect and stop the robot; driving and settings need control
+// (closer_access.h: the same {"access":..} messages as on /ws), or the fixed access code set by an admin, which gives
+// control too: "code:<code>" -> {"auth":1} or {"auth":0}. A wrong fixed code makes every connection wait 2 s before
+// the next try (6 characters at least: guessing takes weeks). Each connection drives as OWNER_BLE + its handle, and
+// gets its own state 10 times a second while the robot moves (once a second otherwise), short enough for one
+// notification: {"drive":1,"l","r","driver","src","deadman","max","auth":0|1 (has control),"code":0|1 (fixed code set),
+// "access":"you"|"other"|"none","shown":seconds the control code is still shown}.
 // "ping:x" comes back as "pong:x" (round-trip test). Losing the connection stops the robot at once if it drove.
 
 #define BLE_SLOTS 3
 static void settings_from(cJSON *j);
-static struct { int conn; bool authed; } ble_slots[BLE_SLOTS] = {{-1, false}, {-1, false}, {-1, false}};
 static int64_t ble_code_wait_us;             // no code checks before this (after a wrong one)
-static portMUX_TYPE ble_mux = portMUX_INITIALIZER_UNLOCKED;
 
-static bool ble_authed(int conn) {
-    bool a = false;
-    portENTER_CRITICAL(&ble_mux);
-    for (int i = 0; i < BLE_SLOTS; i++) if (ble_slots[i].conn == conn) a = ble_slots[i].authed;
-    portEXIT_CRITICAL(&ble_mux);
-    return a && ble_code[0];                  // (switching the code off ends every session)
-}
-
-static void ble_set_authed(int conn) {
-    portENTER_CRITICAL(&ble_mux);
-    int k = -1;
-    for (int i = 0; i < BLE_SLOTS; i++) if (ble_slots[i].conn == conn) k = i;
-    for (int i = 0; i < BLE_SLOTS && k < 0; i++) if (ble_slots[i].conn < 0) k = i;
-    if (k >= 0) ble_slots[k].conn = conn, ble_slots[k].authed = true;
-    portEXIT_CRITICAL(&ble_mux);
-}
+static bool ble_authed(int conn) { return closer_access_has(OWNER_BLE + conn); }
 
 static int ble_state_json(char *out, size_t len, int conn) {
     portENTER_CRITICAL(&drive_mux);
@@ -1039,11 +1086,13 @@ static int ble_state_json(char *out, size_t len, int conn) {
     bool dm = D.stopped_by_deadman;
     portEXIT_CRITICAL(&drive_mux);
     return snprintf(out, len, "{\"drive\":1,\"l\":%.2f,\"r\":%.2f,\"driver\":\"%s\",\"src\":\"%s\",\"deadman\":%d,\"max\":%u,"
-                    "\"auth\":%d,\"code\":%d}", l, r, who, src, dm, cfg.max_pct, ble_authed(conn), ble_code[0] != 0);
+                    "\"auth\":%d,\"code\":%d,\"access\":\"%s\",\"shown\":%d}", l, r, who, src, dm, cfg.max_pct,
+                    ble_authed(conn), ble_code[0] != 0, closer_access_state(OWNER_BLE + conn),
+                    closer_access_code(NULL, 0, NULL, 0));
 }
 
 static void ble_send_state(int conn) {
-    char buf[176];
+    char buf[200];
     ble_state_json(buf, sizeof buf, conn);
     closer_ble_notify(conn, buf);
 }
@@ -1065,12 +1114,18 @@ static void ble_command(int conn, const char *text) {
         closer_ble_notify(conn, pong);
         return;
     }
+    char reply[96];
+    if (closer_access_message(OWNER_BLE + conn, text, reply, sizeof reply)) {
+        closer_ble_notify(conn, reply);
+        ble_send_state(conn);
+        return;
+    }
     if (strncmp(text, "code:", 5) == 0) {
         int64_t now = esp_timer_get_time();
         bool ok = false, waited = now >= ble_code_wait_us;
         if (waited) {
             ok = ble_code_ok(text + 5);
-            if (ok) ble_set_authed(conn);
+            if (ok) closer_access_take(OWNER_BLE + conn);
             else ble_code_wait_us = now + 2000 * 1000LL;
         }
         ESP_LOGI(TAG, "Bluetooth %d: code %s", conn, ok ? "accepted" : waited ? "wrong" : "too soon");
@@ -1086,7 +1141,7 @@ static void ble_command(int conn, const char *text) {
     if (cJSON_GetObjectItem(j, "stop")) {
         drive_command(OWNER_BLE + conn, 0, 0, NULL);           // anyone may stop it
     } else if (!ble_authed(conn)) {
-        closer_ble_notify(conn, ble_code[0] ? "{\"auth\":0,\"need\":1}" : "{\"auth\":0,\"nocode\":1}");
+        closer_ble_notify(conn, "{\"auth\":0,\"need\":1}");
     } else if (cJSON_IsObject(set)) {
         cJSON_DeleteItemFromObject(set, "ble_code");           // the code is changed through the site only
         settings_from(set);
@@ -1100,9 +1155,7 @@ static void ble_command(int conn, const char *text) {
 
 static void ble_gone(int conn) {
     drive_client_gone(OWNER_BLE + conn);
-    portENTER_CRITICAL(&ble_mux);
-    for (int i = 0; i < BLE_SLOTS; i++) if (ble_slots[i].conn == conn) ble_slots[i].conn = -1, ble_slots[i].authed = false;
-    portEXIT_CRITICAL(&ble_mux);
+    closer_access_gone(OWNER_BLE + conn);
 }
 
 // ------------------------------------------------------------------ live stream on /ws
@@ -1237,12 +1290,25 @@ static esp_err_t send_json(httpd_req_t *req, const char *s) {
     return httpd_resp_sendstr(req, s);
 }
 
-// GET /api/drive: the state. POST /api/drive?x=..&y=..[&src=..]: one command (repeat it: the dead-man stop applies);
-// POST /api/drive?stop=1: stop.
+// HTTP requests with control: the token of a WebSocket or Bluetooth client that got control (closer_access.h), in
+// ?token= or the header X-Access-Token. It moves control to HTTP (OWNER_HTTP).
+static bool http_control(httpd_req_t *req, const char *query) {
+    char t[24] = "", msg[64], reply[64];
+    if (!query || httpd_query_key_value(query, "token", t, sizeof t) != ESP_OK)
+        if (httpd_req_get_hdr_value_str(req, "X-Access-Token", t, sizeof t) != ESP_OK) t[0] = 0;
+    if (!t[0] || strspn(t, "0123456789abcdef") != strlen(t)) return false;     // (every request brings the token)
+    if (closer_access_has(OWNER_HTTP) && closer_access_token_ok(t)) return true;
+    snprintf(msg, sizeof msg, "{\"access\":\"token\",\"token\":\"%s\"}", t);
+    closer_access_message(OWNER_HTTP, msg, reply, sizeof reply);
+    return closer_access_has(OWNER_HTTP);
+}
+
+// GET /api/drive: the state. POST /api/drive?x=..&y=..[&src=..]&token=..: one command (repeat it: the dead-man stop
+// applies; moving needs control, see http_control); POST /api/drive?stop=1: stop (anyone).
 static esp_err_t drive_http(httpd_req_t *req) {
     touch(req);
     if (req->method == HTTP_POST) {
-        char q[96], v[20], src[16] = "http";
+        char q[128], v[20], src[16] = "http";
         if (httpd_req_get_url_query_str(req, q, sizeof q) == ESP_OK) {
             if (httpd_query_key_value(q, "stop", v, sizeof v) == ESP_OK) {
                 drive_command(OWNER_HTTP, 0, 0, NULL);
@@ -1251,9 +1317,11 @@ static esp_err_t drive_http(httpd_req_t *req) {
                 if (httpd_query_key_value(q, "x", v, sizeof v) == ESP_OK) x = strtof(v, NULL);
                 if (httpd_query_key_value(q, "y", v, sizeof v) == ESP_OK) y = strtof(v, NULL);
                 httpd_query_key_value(q, "src", src, sizeof src);
+                bool control = http_control(req, q);
                 if (!drive_command(OWNER_HTTP, x, y, src)) {
-                    httpd_resp_set_status(req, "409 Conflict");
-                    return send_json(req, "{\"error\":\"someone else is driving\"}");
+                    httpd_resp_set_status(req, control ? "409 Conflict" : "403 Forbidden");
+                    return send_json(req, control ? "{\"error\":\"someone else is driving\"}" :
+                                                    "{\"error\":\"no control: get the code from the robot first\"}");
                 }
             }
         }
@@ -1263,7 +1331,8 @@ static esp_err_t drive_http(httpd_req_t *req) {
     return send_json(req, out);
 }
 
-// Settings from JSON: {"max":60,"accel":25,"trim":0,"rev_left":0,"rev_right":0,"min":30,"ble_code":"..."}; any subset.
+// Settings from JSON: {"max":100,"accel":25,"trim":0,"rev_left":0,"rev_right":0,"min":10,"ble_code":"..."}; any subset.
+// The callers check control first; "ble_code" only from a holder with the server's grant (an admin through the site).
 static void settings_from(cJSON *j) {
     cJSON *v;
     if ((v = cJSON_GetObjectItem(j, "max")) && cJSON_IsNumber(v) && v->valueint >= 10 && v->valueint <= 100) cfg.max_pct = v->valueint;
@@ -1274,19 +1343,19 @@ static void settings_from(cJSON *j) {
     if ((v = cJSON_GetObjectItem(j, "min")) && cJSON_IsNumber(v) && v->valueint >= 0 && v->valueint <= 60) cfg.min_pct = v->valueint;
     if ((v = cJSON_GetObjectItem(j, "ble_code")) && cJSON_IsString(v)) {
         size_t n = strlen(v->valuestring);
-        if ((n == 0 || (n >= 6 && n < sizeof ble_code)) && strcmp(ble_code, v->valuestring) != 0) {
-            strlcpy(ble_code, v->valuestring, sizeof ble_code);
-            portENTER_CRITICAL(&ble_mux);        // a new code: everyone gives it again
-            for (int i = 0; i < BLE_SLOTS; i++) ble_slots[i].authed = false;
-            portEXIT_CRITICAL(&ble_mux);
-        }
+        if (n == 0 || (n >= 6 && n < sizeof ble_code)) strlcpy(ble_code, v->valuestring, sizeof ble_code);
     }
     settings_save();
 }
 
-// POST /api/settings with a JSON body (see settings_from).
+// POST /api/settings with a JSON body (see settings_from); needs control (http_control).
 static esp_err_t settings_post(httpd_req_t *req) {
     touch(req);
+    char q[64];
+    if (!http_control(req, httpd_req_get_url_query_str(req, q, sizeof q) == ESP_OK ? q : NULL)) {
+        httpd_resp_set_status(req, "403 Forbidden");
+        return send_json(req, "{\"error\":\"no control: get the code from the robot first\"}");
+    }
     char body[256];
     int n = req->content_len < sizeof body - 1 ? req->content_len : sizeof body - 1, got = 0;
     while (got < n) {
@@ -1297,6 +1366,7 @@ static esp_err_t settings_post(httpd_req_t *req) {
     body[got] = 0;
     cJSON *j = cJSON_Parse(body);
     if (!j) { httpd_resp_set_status(req, "400 Bad Request"); return send_json(req, "{\"error\":\"JSON expected\"}"); }
+    if (!closer_access_by_grant(OWNER_HTTP)) cJSON_DeleteItemFromObject(j, "ble_code");   // (the fixed code: admins only)
     settings_from(j);
     cJSON_Delete(j);
     char out[480];
@@ -1305,8 +1375,9 @@ static esp_err_t settings_post(httpd_req_t *req) {
 }
 
 // WebSocket /ws. Text frames: "stream" (the live state: Wi-Fi twice a second, the drive state up to 10 a second);
-// {"x":..,"y":..,"src":"touch"} a drive command; {"stop":1}; {"set":{settings}}. A refused command (someone else
-// drives) gets {"busy":1} back.
+// {"access":..} (control, closer_access.h; the answer comes back); {"x":..,"y":..,"src":"touch"} a drive command;
+// {"stop":1}; {"set":{settings}}. Driving and settings need control: without it {"need":1} comes back; a command
+// refused for another reason (someone else drives) gets {"busy":1}.
 static esp_err_t ws_handler(httpd_req_t *req) {
     if (req->method == HTTP_GET) { touch(req); return ESP_OK; }      // the handshake
     httpd_ws_frame_t frame = {.type = HTTPD_WS_TYPE_TEXT};
@@ -1315,23 +1386,34 @@ static esp_err_t ws_handler(httpd_req_t *req) {
     esp_err_t err = httpd_ws_recv_frame(req, &frame, sizeof buf - 1);
     if (err != ESP_OK) return err;
     int fd = httpd_req_to_sockfd(req);
-    if (frame.type == HTTPD_WS_TYPE_CLOSE) { drive_client_gone(fd); return ESP_OK; }
+    if (frame.type == HTTPD_WS_TYPE_CLOSE) { drive_client_gone(fd); closer_access_gone(fd); return ESP_OK; }
     if (frame.type != HTTPD_WS_TYPE_TEXT) return ESP_OK;
     buf[frame.len] = 0;
     if (strcmp(buf, "stream") == 0) { touch_client(req); stream_add(fd); return ESP_OK; }
+    char reply[96];
+    if (closer_access_message(fd, buf, reply, sizeof reply)) {
+        httpd_ws_frame_t r = {.type = HTTPD_WS_TYPE_TEXT, .payload = (uint8_t *)reply, .len = strlen(reply)};
+        ws_send(fd, &r);
+        return ESP_OK;
+    }
     cJSON *j = cJSON_Parse(buf);
     if (!j) return ESP_OK;
     cJSON *x = cJSON_GetObjectItem(j, "x"), *y = cJSON_GetObjectItem(j, "y"), *src = cJSON_GetObjectItem(j, "src"),
           *set = cJSON_GetObjectItem(j, "set");
+    const char *answer = NULL;
     if (cJSON_GetObjectItem(j, "stop")) {
         drive_command(fd, 0, 0, NULL);
     } else if (cJSON_IsObject(set)) {
-        settings_from(set);
+        if (!closer_access_by_grant(fd)) cJSON_DeleteItemFromObject(set, "ble_code");   // (the fixed code: admins only)
+        if (closer_access_has(fd)) settings_from(set);
+        else answer = "{\"need\":1}";
     } else if (cJSON_IsNumber(x) && cJSON_IsNumber(y)) {
-        if (!drive_command(fd, (float)x->valuedouble, (float)y->valuedouble, cJSON_IsString(src) ? src->valuestring : "")) {
-            httpd_ws_frame_t busy = {.type = HTTPD_WS_TYPE_TEXT, .payload = (uint8_t *)"{\"busy\":1}", .len = 10};
-            ws_send(fd, &busy);
-        }
+        if (!drive_command(fd, (float)x->valuedouble, (float)y->valuedouble, cJSON_IsString(src) ? src->valuestring : ""))
+            answer = closer_access_has(fd) ? "{\"busy\":1}" : "{\"need\":1}";
+    }
+    if (answer) {
+        httpd_ws_frame_t r = {.type = HTTPD_WS_TYPE_TEXT, .payload = (uint8_t *)answer, .len = strlen(answer)};
+        ws_send(fd, &r);
     }
     cJSON_Delete(j);
     return ESP_OK;
@@ -1340,6 +1422,7 @@ static esp_err_t ws_handler(httpd_req_t *req) {
 // A connection closed (the page left, the network dropped): if it was driving, stop.
 static void on_close(httpd_handle_t hd, int fd) {
     drive_client_gone(fd);
+    closer_access_gone(fd);
     close(fd);
 }
 
@@ -1347,7 +1430,7 @@ static void web_start(void) {
     httpd_config_t c = HTTPD_DEFAULT_CONFIG();
     c.lru_purge_enable = true;
     c.stack_size = 6144;
-    c.max_uri_handlers = 18;       // (16 in use: 10 here, 3 for the Wi-Fi settings page, 3 for the UDP test)
+    c.max_uri_handlers = 24;       // (18 in use: 12 here, 3 for the Wi-Fi settings page, 3 for the UDP test)
     c.send_wait_timeout = 2;       // a stalled viewer must not hold the others up for long
     c.close_fn = on_close;
     httpd_handle_t srv;
@@ -1363,6 +1446,8 @@ static void web_start(void) {
         {.uri = "/api/wifi/aps", .method = HTTP_GET, .handler = aps_get},
         {.uri = "/api/survey", .method = HTTP_GET, .handler = survey_handler},
         {.uri = "/api/survey", .method = HTTP_POST, .handler = survey_handler},
+        {.uri = "/api/update", .method = HTTP_GET, .handler = update_handler},
+        {.uri = "/api/update", .method = HTTP_POST, .handler = update_handler},
         {.uri = "/ws", .method = HTTP_GET, .handler = ws_handler, .is_websocket = true},
     };
     for (int i = 0; i < sizeof uris / sizeof uris[0]; i++) httpd_register_uri_handler(srv, &uris[i]);
@@ -1374,6 +1459,11 @@ void app_main(void) {
     motors_init();                      // first: the inputs low (motors off) as soon as possible
     closer_demo_start(NULL);            // (named after its key: besbot, ...) also initialises NVS
     settings_load();
+    static char control_page[64];       // (the QR code on the display links here, with the code)
+    snprintf(control_page, sizeof control_page, "q/%s", closer_demo_name());     // (the site sends it on to the drive page)
+    closer_access_init(control_page, access_changed);
+    closer_access_set_digits(2);       // (the user's choice: easy to type; 2 tries a code, and every code shows)
+    if (CONFIG_BESBOT_OLED_SDA_GPIO >= 0) display_start(CONFIG_BESBOT_OLED_SDA_GPIO, CONFIG_BESBOT_OLED_SCL_GPIO, display_drive);
     led_strip_config_t sc = {.strip_gpio_num = CONFIG_BESBOT_LED_GPIO, .max_leds = 1, .led_model = LED_MODEL_WS2812,
                              .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB};
     led_strip_rmt_config_t rc = {.clk_src = RMT_CLK_SRC_DEFAULT, .resolution_hz = 10 * 1000 * 1000};

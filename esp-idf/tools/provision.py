@@ -6,6 +6,7 @@
 
 One firmware serves several boards: each is named after the demo id in its key (besbot, besbot-2, ...).
 Reads the Wi-Fi settings  {"ssid": ..., "password": ..., "base_url": ...}  from local/<name>.json
+(optionally "more": [{"ssid": ..., "password": ...}, ...]: further saved networks, tried when the first isn't there)
 and the key from local/<name>.key (`python -m labdemos.cli add <name>` on the server),
 and writes into local/:
     <name>-factory.bin   everything (bootloader, partitions, firmware, settings): flash once at 0x0
@@ -40,6 +41,12 @@ with (local / "settings.csv").open("w", newline="") as f:
     w.writerow(["wifi_pass", "data", "string", conf.get("password", "")])
     w.writerow(["base_url", "data", "string", conf.get("base_url", "https://closer.ram.eemcs.utwente.nl/labdemos")])
     w.writerow(["key", "data", "string", key])
+    nets = [conf] + conf.get("more", [])
+    if len(nets) > 1:       # closer_demo's saved networks: blobs n0.. of {char ssid[33]; char pass[65];}
+        w.writerow(["closer_nets", "namespace", "", ""])
+        for i, n in enumerate(nets[:8]):
+            blob = n["ssid"].encode().ljust(33, b"\0")[:33] + n.get("password", "").encode().ljust(65, b"\0")[:65]
+            w.writerow([f"n{i}", "data", "hex2bin", blob.hex()])
 (local / "settings.csv").chmod(0o600)
 
 subprocess.check_call([sys.executable, str(idf / "components/nvs_flash/nvs_partition_generator/nvs_partition_gen.py"),

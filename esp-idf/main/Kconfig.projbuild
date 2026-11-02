@@ -13,7 +13,7 @@ menu "BesBot"
         default 26
     config BESBOT_MAX_PCT
         int "Default top speed in percent (changeable on the page)"
-        default 70
+        default 100
         range 10 100
     config BESBOT_LED_GPIO
         int "GPIO of the on-board RGB LED"
@@ -23,6 +23,18 @@ menu "BesBot"
     config BESBOT_LED_SWAP_RG
         bool "The LED's red and green are swapped (Waveshare ESP32-C5 boards)"
         default y
+    config BESBOT_OLED_SDA_GPIO
+        int "GPIO to the OLED display's SDA (-1: no display)"
+        default 3
+    config BESBOT_OLED_SCL_GPIO
+        int "GPIO to the OLED display's SCL"
+        default 2
+    config BESBOT_OLED_SH1106
+        bool "The display has an SH1106 controller (most 1.3\" ones) instead of an SSD1306 (0.96\")"
+        default n
+    config BESBOT_OLED_FLIP
+        bool "The display is mounted upside down"
+        default n
     config BESBOT_BRIGHTNESS
         int "LED brightness in percent"
         default 25
