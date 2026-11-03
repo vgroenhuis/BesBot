@@ -246,7 +246,8 @@ static void connected_screen(const closer_demo_status_t *st) {
 static void offline_screen(const closer_demo_status_t *st, int tick) {
     char line[64], detail[48] = "";
     bool busy = strncmp(st->wifi, "Searching", 9) == 0 || strncmp(st->wifi, "Getting", 7) == 0 ||
-                strncmp(st->wifi, "Starting", 8) == 0 || strncmp(st->wifi, "Joining", 7) == 0;
+                strncmp(st->wifi, "Starting", 8) == 0 || strncmp(st->wifi, "Joining", 7) == 0 ||
+                strncmp(st->wifi, "Looking", 7) == 0;
     snprintf(line, sizeof line, "%s%.*s", st->wifi, busy ? tick / 3 % 4 : 0, "...");
     int lines = wrapped(0, 24, 11, W - 1, 2, u8g2_font_helvB08_tr, line);
     if (st->attempts > 1) snprintf(detail, sizeof detail, "attempt %d", st->attempts);
