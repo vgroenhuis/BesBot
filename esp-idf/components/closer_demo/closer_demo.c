@@ -53,6 +53,9 @@ static struct {
     int64_t retry_ota_us;       // after a failed download: not before this (uptime)
     int ota_tries;
     bool ota_busy;
+    int ota_pct;                // the download so far (%)
+    char ota_error[96];         // why the last update failed ("" none)
+    int64_t ota_failed_us;      // when (uptime)
     bool checking;          // "Check for updates" asked: until the next answer
     char offered[24];       // the version the site's last answer offered ("": none)
     int64_t answered_us;    // when the site last answered a report (0: not yet)
@@ -200,6 +203,8 @@ void closer_demo_get_status(closer_demo_status_t *out) {
     memset(out, 0, sizeof *out);
     out->connected = closer_demo_wifi_connected();
     out->updating = S.ota_busy;
+    out->update_pct = S.ota_pct;
+    out->update_failed_s = S.ota_failed_us ? (int)((esp_timer_get_time() - S.ota_failed_us) / 1000000) : -1;
     if (out->connected) {
         esp_netif_ip_info_t ip;
         esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
@@ -221,6 +226,7 @@ void closer_demo_get_status(closer_demo_status_t *out) {
         xSemaphoreTake(S.lock, portMAX_DELAY);
         strlcpy(out->note, S.message, sizeof out->note);
         strlcpy(out->wifi, S.wifi, sizeof out->wifi);
+        strlcpy(out->update_error, S.ota_error, sizeof out->update_error);
         xSemaphoreGive(S.lock);
     }
     strlcpy(out->ssid, S.ssid, sizeof out->ssid);
@@ -843,6 +849,10 @@ static void ota_task(void *arg) {
     psa_hash_operation_t sha = PSA_HASH_OPERATION_INIT;
     bool sha_ok = psa_crypto_init() == PSA_SUCCESS && psa_hash_setup(&sha, PSA_ALG_SHA_256) == PSA_SUCCESS;
     char *buf = malloc(4096);
+    char why[96] = "";                   // the reason, for the page and the display
+    S.ota_pct = 0;
+    if (!slot) strlcpy(why, "no slot to install it in", sizeof why);
+    else if (!buf || !sha_ok) strlcpy(why, "out of memory", sizeof why);
     if (slot && buf && sha_ok) {
         // Where the Wi-Fi is poor a download can stall: it then continues where it broke off (HTTP Range) instead of
         // starting over, as long as it gets somewhere: up to 5 connections in a row without progress, 80 in all
@@ -853,14 +863,18 @@ static void ota_task(void *arg) {
             if (attempt) vTaskDelay(pdMS_TO_TICKS(1000));
             int before = got;
             esp_http_client_handle_t c = esp_http_client_init(&cfg);
-            if (!c) break;
+            if (!c) { strlcpy(why, "out of memory (HTTP)", sizeof why); break; }
             set_auth(c);
             char range[32];
             if (got) {
                 snprintf(range, sizeof range, "bytes=%d-", got);
                 esp_http_client_set_header(c, "Range", range);
             }
-            if (esp_http_client_open(c, 0) == ESP_OK) {
+            esp_err_t oe = esp_http_client_open(c, 0);
+            if (oe != ESP_OK) {
+                snprintf(why, sizeof why, "can't connect to the site (%s)", esp_err_to_name(oe));
+                ESP_LOGW(TAG, "Download: %s", why);
+            } else {
                 int len = esp_http_client_fetch_headers(c);
                 int status = esp_http_client_get_status_code(c);
                 if (!begun) {
@@ -869,16 +883,32 @@ static void ota_task(void *arg) {
                         begun = true;
                     } else {
                         ESP_LOGE(TAG, "Download refused: status %d, length %d", status, len);
+                        if (status == 200 && len > 0 && size && len != size) snprintf(why, sizeof why, "wrong size: %d, not %d bytes", len, size);
+                        else if (status == 200 && len > 0) strlcpy(why, "can't start writing to flash", sizeof why);
+                        else snprintf(why, sizeof why, "the site said %d", status);
                         broken = true;
                     }
                 } else if (status != 206 || len != total - got) {
                     ESP_LOGE(TAG, "Can't resume the download: status %d, length %d", status, len);
+                    snprintf(why, sizeof why, "can't resume: the site said %d", status);
                     broken = true;
                 }
-                int n;
+                int n = 0;
                 while (!broken && (n = esp_http_client_read(c, buf, 4096)) > 0) {
-                    if (psa_hash_update(&sha, (uint8_t *)buf, n) != PSA_SUCCESS || esp_ota_write(ota, buf, n) != ESP_OK) broken = true;
-                    else got += n;
+                    esp_err_t we = ESP_OK;
+                    if (psa_hash_update(&sha, (uint8_t *)buf, n) != PSA_SUCCESS || (we = esp_ota_write(ota, buf, n)) != ESP_OK) {
+                        snprintf(why, sizeof why, "writing to flash failed (%s)", esp_err_to_name(we));
+                        broken = true;
+                    } else {
+                        got += n;
+                        if (total) S.ota_pct = (int)(100LL * got / total);
+                    }
+                }
+                if (!broken && begun && got < total) {
+                    snprintf(why, sizeof why, "the download kept breaking off (at %d %%, read %d, errno %d)",
+                             (int)(100LL * got / total), n, esp_http_client_get_errno(c));
+                    ESP_LOGW(TAG, "Download: read returned %d, errno %d, after %d bytes (%d in this connection)", n,
+                             esp_http_client_get_errno(c), got, got - before);
                 }
             }
             esp_http_client_close(c);
@@ -892,10 +922,10 @@ static void ota_task(void *arg) {
         size_t dlen = 0;
         if (psa_hash_finish(&sha, digest, sizeof digest, &dlen) != PSA_SUCCESS || dlen != 32) ok = false;
         hex(digest, 32, dh);
-        if (ok && strcasecmp(dh, want_sha) != 0) { ESP_LOGE(TAG, "SHA-256 mismatch"); ok = false; }
-        if (ok && esp_ota_end(ota) != ESP_OK) ok = false;
+        if (ok && strcasecmp(dh, want_sha) != 0) { ESP_LOGE(TAG, "SHA-256 mismatch"); ok = false; strlcpy(why, "checksum wrong", sizeof why); }
+        if (ok && esp_ota_end(ota) != ESP_OK) { ok = false; strlcpy(why, "the image isn't valid", sizeof why); }
         else if (!ok && begun) esp_ota_abort(ota);
-        if (ok && esp_ota_set_boot_partition(slot) != ESP_OK) ok = false;
+        if (ok && esp_ota_set_boot_partition(slot) != ESP_OK) { ok = false; strlcpy(why, "can't select the new image", sizeof why); }
     }
     psa_hash_abort(&sha);
     free(buf);
@@ -909,10 +939,15 @@ static void ota_task(void *arg) {
     S.ota_tries++;
     int wait_min = S.ota_tries >= 4 ? 60 : 5 << (S.ota_tries - 1);
     S.retry_ota_us = esp_timer_get_time() + wait_min * 60 * 1000000LL;
-    ESP_LOGE(TAG, "Update to %s failed; staying on %s, trying again in %d min", version, S.version, wait_min);
-    char m[64];
-    snprintf(m, sizeof m, "update to %s failed (download), again in %d min", version, wait_min);
+    if (!why[0]) strlcpy(why, "download failed", sizeof why);
+    ESP_LOGE(TAG, "Update to %s failed (%s); staying on %s, trying again in %d min", version, why, S.version, wait_min);
+    char m[200];                         // (the page takes 120)
+    snprintf(m, sizeof m, "update to %s failed: %s; again in %d min", version, why, wait_min);
     closer_demo_set_message(m);
+    xSemaphoreTake(S.lock, portMAX_DELAY);
+    strlcpy(S.ota_error, why, sizeof S.ota_error);
+    xSemaphoreGive(S.lock);
+    S.ota_failed_us = esp_timer_get_time();
     cJSON_Delete(u);
     S.ota_busy = false;
     vTaskDelete(NULL);

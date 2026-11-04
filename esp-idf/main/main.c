@@ -6,6 +6,10 @@
 // The on-board RGB LED is a Wi-Fi signal light (as on the Turtle). Wi-Fi, reporting to the lab demos page and
 // over-the-air updates come from the closer_demo component; the Wi-Fi meter, history, access point lists and surveys
 // are the Turtle's.
+// Since 1.7.0 the wheels have encoders (wheels.c): drive modes "power" (the original: a command sets the motors'
+// power) and "speed" (a command sets each wheel's speed, held by the encoders), with a calibration for the latter;
+// since 1.8.0 "lab" (lab position control: buttons move 0.5 m or turn 90 degrees, a second-order response with
+// adjustable Kp and damping ratio).
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -15,6 +19,7 @@
 #include "cJSON.h"
 #include "closer_access.h"
 #include "display.h"
+#include "wheels.h"
 #include "closer_ble.h"
 #include "closer_demo.h"
 #include "closer_udp.h"
@@ -97,6 +102,8 @@ static void touch(httpd_req_t *req) {
 #define DEADMAN_MS 500           // no new command for this long: stop (the pages send 10-20 a second)
 #define LEASE_MS 1500            // the driver keeps the robot for this long after its last moving command
 #define CONTROL_HZ 100
+#define DRIVE_HOLD_MS 10000      // after the last movement the robot stays in driving mode this long (LED in the
+                                 // controller's colour, no Wi-Fi scans or updates): the next command finds it ready
 
 static const int MOTOR_GPIO[4] = {CONFIG_BESBOT_IN1_GPIO, CONFIG_BESBOT_IN2_GPIO, CONFIG_BESBOT_IN3_GPIO, CONFIG_BESBOT_IN4_GPIO};
 
@@ -107,6 +114,13 @@ typedef struct {
     uint8_t rev_left, rev_right;
     uint8_t min_pct;         // below this duty the motors only hum: commands under it start at it (0: off)
 } settings_t;
+// (kept apart from settings_t, whose saved size must not change)
+enum { MODE_POWER, MODE_SPEED, MODE_LAB };
+static const char *MODE_NAMES[] = {"power", "speed", "lab"};
+static uint8_t drive_mode = MODE_POWER;    // NVS besbot/mode
+static int enc_fault = -1;                 // speed/lab mode stopped on this wheel (stalled, or its encoder): power until chosen again
+typedef struct { float kp, zeta; } lab_cfg_t;
+static lab_cfg_t lab_cfg = {39.48f, 0.7f};   // NVS besbot/lab; Kp = (2 pi 1 Hz)^2: undamped, it swings at 1 Hz
 static settings_t cfg = {.max_pct = CONFIG_BESBOT_MAX_PCT, .accel_pct = 25, .trim = 0, .min_pct = 10};
 
 static portMUX_TYPE drive_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -136,6 +150,10 @@ static void settings_load(void) {
         if (nvs_get_blob(h, "settings", &s, &len) == ESP_OK && len == sizeof s) cfg = s;
         len = sizeof ble_code;
         if (nvs_get_str(h, "ble_code", ble_code, &len) != ESP_OK) ble_code[0] = 0;
+        if (nvs_get_u8(h, "mode", &drive_mode) != ESP_OK || drive_mode > MODE_LAB) drive_mode = MODE_POWER;
+        lab_cfg_t lc;
+        len = sizeof lc;
+        if (nvs_get_blob(h, "lab", &lc, &len) == ESP_OK && len == sizeof lc) lab_cfg = lc;
         nvs_close(h);
     }
     // Once each: a saved old default becomes the new one (top speed 70 -> 100 % in 1.5.1, minimum power 30 -> 10 %
@@ -166,6 +184,8 @@ static void settings_save(void) {
     if (nvs_open("besbot", NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_blob(h, "settings", &cfg, sizeof cfg);
         nvs_set_str(h, "ble_code", ble_code);
+        nvs_set_u8(h, "mode", drive_mode);
+        nvs_set_blob(h, "lab", &lab_cfg, sizeof lab_cfg);
         nvs_commit(h);
         nvs_close(h);
     }
@@ -182,15 +202,11 @@ static void motors_init(void) {
     }
 }
 
-// One motor: v -1..1 on its two inputs (side 0 left: IN1/IN2, 1 right: IN3/IN4).
-static void motor_write(int side, float v) {
+// One motor: duty -1..1 on its two inputs (side 0 left: IN1/IN2, 1 right: IN3/IN4).
+static void motor_duty(int side, float v) {
     if ((side == 0 && cfg.rev_left) || (side == 1 && cfg.rev_right)) v = -v;
-    float m = fabsf(v);
-    uint32_t duty = 0;
-    if (m > 0.001f) {
-        float lo = cfg.min_pct / 100.0f;                 // (a dead band at low duty: skip it)
-        duty = (uint32_t)lroundf((lo + (1 - lo) * m) * PWM_MAX);
-    }
+    float m = fminf(fabsf(v), 1);
+    uint32_t duty = m > 0.001f ? (uint32_t)lroundf(m * PWM_MAX) : 0;
     ledc_channel_t fwd = (ledc_channel_t)(side * 2), rev = (ledc_channel_t)(side * 2 + 1);
     ledc_set_duty(LEDC_LOW_SPEED_MODE, v > 0 ? rev : fwd, 0);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, v > 0 ? rev : fwd);
@@ -198,7 +214,14 @@ static void motor_write(int side, float v) {
     ledc_update_duty(LEDC_LOW_SPEED_MODE, v > 0 ? fwd : rev);
 }
 
+// Power mode: v -1..1, above the minimum power (a dead band at low duty: skipped).
+static void motor_write(int side, float v) {
+    float lo = cfg.min_pct / 100.0f;
+    motor_duty(side, fabsf(v) > 0.001f ? copysignf(lo + (1 - lo) * fabsf(v), v) : 0);
+}
+
 static float clamp1(float v) { return v < -1 ? -1 : v > 1 ? 1 : v; }
+static void lab_stop(void);
 
 // A command from a driver: false when it may not drive. Moving needs control (closer_access: the code from the robot,
 // or the site's grant); a stop is always accepted, from anyone. (Within control, the old lease rule stays: the robot is
@@ -213,7 +236,15 @@ static bool drive_command(int who, float x, float y, const char *src) {
         portEXIT_CRITICAL(&drive_mux);
         return false;
     }
+    if (moving && drive_mode == MODE_LAB && enc_fault < 0) {         // (lab mode: the buttons move it, see lab_click)
+        portENTER_CRITICAL(&drive_mux);
+        D.refused++;
+        portEXIT_CRITICAL(&drive_mux);
+        return false;
+    }
     if (moving) closer_access_used(who);
+    else lab_stop();
+    if (wheels_cal_running()) wheels_cal_abort(moving ? "a drive command came" : "someone pressed stop");
     int64_t now = esp_timer_get_time();
     bool ok = true;
     portENTER_CRITICAL(&drive_mux);
@@ -228,9 +259,8 @@ static bool drive_command(int who, float x, float y, const char *src) {
         D.stopped_by_deadman = false;
         float l = y + x, r = y - x, big = fmaxf(fabsf(l), fabsf(r));
         if (big > 1) l /= big, r /= big;
-        float k = cfg.max_pct / 100.0f;
-        float tl = cfg.trim < 0 ? 1 + cfg.trim / 100.0f : 1, tr = cfg.trim > 0 ? 1 - cfg.trim / 100.0f : 1;
-        D.target[0] = l * k * tl, D.target[1] = r * k * tr;
+        float k = cfg.max_pct / 100.0f;           // (the trim: in power mode only, see control_task)
+        D.target[0] = l * k, D.target[1] = r * k;
         if (src && *src) strlcpy(D.src, src, sizeof D.src);
         D.commands++;
     }
@@ -247,21 +277,150 @@ static void drive_client_gone(int fd) {
 
 // Control moved to someone else (or ended): stop, whoever drove.
 static void access_changed(int from, int to) {
+    wheels_cal_abort("control changed");
+    lab_stop();
     portENTER_CRITICAL(&drive_mux);
     D.x = D.y = D.target[0] = D.target[1] = 0;
     D.owner = -1;
     portEXIT_CRITICAL(&drive_mux);
 }
 
-// Moving now, or in the last few seconds: Wi-Fi scans wait (they hold up traffic, so commands, for seconds).
-static bool driving_recently(void) { return esp_timer_get_time() - D.moving_us < 3000 * 1000LL; }
+// Moving now, or in the last DRIVE_HOLD_MS: Wi-Fi scans wait (they hold up traffic, so commands, for seconds).
+static bool driving_recently(void) { return esp_timer_get_time() - D.moving_us < DRIVE_HOLD_MS * 1000LL; }
 
+// ------------------------------------------------------------------ lab position control (since 1.8.0)
+// Buttons move the robot 0.5 m forward or back, or turn it 90 degrees on the spot; clicks add up. Each wheel's position
+// follows a virtual mass-spring-damper towards its target: a = Kp (target - x) - 2 zeta sqrt(Kp) v, natural frequency
+// sqrt(Kp) rad/s (the default 39.5 1/s^2: 1 Hz); zeta 0 undamped, below 1 underdamped, 1 critically damped, above 1
+// overdamped. The speed control (wheels.c) makes the wheel follow that trajectory. The robot can't do all the model
+// asks (an undamped 0.5 m step at 1 Hz would need 3 m/s): the model's speed is held to the robot's top speed and its
+// acceleration to LAB_ACCEL ("lim" in the state). STOP, a change of control, or LAB_IDLE_S without a click stop it.
+
+#define LAB_STEP_MM 500.0f
+#define LAB_TURN_MM ((float)M_PI / 2 * WHEEL_BASE_MM / 2)      // a wheel's travel for 90 degrees on the spot
+#define LAB_ACCEL 2000.0f                                     // mm/s^2
+#define LAB_IDLE_S 60
+
+static struct {
+    bool active, limited;
+    float tgt[2], x[2], v[2];          // per wheel (mm, mm/s): target, the model's position and speed
+    float origin[2];                   // the wheels' positions when lab mode began (for the state's distance/heading)
+    int64_t click_us;
+} L;
+static portMUX_TYPE lab_mux = portMUX_INITIALIZER_UNLOCKED;
+
+// Entering lab mode: everything from where the wheels are now.
+static void lab_reset(void) {
+    portENTER_CRITICAL(&lab_mux);
+    for (int s = 0; s < 2; s++) L.origin[s] = L.tgt[s] = L.x[s] = wheels_position(s), L.v[s] = 0;
+    L.active = L.limited = false;
+    portEXIT_CRITICAL(&lab_mux);
+}
+
+// Stop where the model is now (the speed control brakes the wheels).
+static void lab_stop(void) {
+    portENTER_CRITICAL(&lab_mux);
+    for (int s = 0; s < 2; s++) L.tgt[s] = L.x[s], L.v[s] = 0;
+    L.active = false;
+    portEXIT_CRITICAL(&lab_mux);
+}
+
+// A button: "fwd", "back", "left" (anticlockwise), "right". The answer for the page: {"lab":"ok"|"mode"|"cal"} or
+// {"need":1} (no control).
+static const char *lab_click(int who, const char *what) {
+    if (drive_mode != MODE_LAB || enc_fault >= 0) return "{\"lab\":\"mode\"}";
+    if (!closer_access_has(who)) return "{\"need\":1}";
+    if (wheels_cal_running()) return "{\"lab\":\"cal\"}";
+    float dl, dr;
+    if (strcmp(what, "fwd") == 0) dl = dr = LAB_STEP_MM;
+    else if (strcmp(what, "back") == 0) dl = dr = -LAB_STEP_MM;
+    else if (strcmp(what, "left") == 0) dl = -LAB_TURN_MM, dr = LAB_TURN_MM;
+    else if (strcmp(what, "right") == 0) dl = LAB_TURN_MM, dr = -LAB_TURN_MM;
+    else return "{\"lab\":\"what\"}";
+    closer_access_used(who);
+    int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL(&lab_mux);
+    if (!L.active)      // (from rest: the model starts where the wheels really are, so small errors don't add up)
+        for (int s = 0; s < 2; s++) L.x[s] = wheels_position(s), L.v[s] = 0;
+    L.tgt[0] += dl, L.tgt[1] += dr;
+    L.active = true;
+    L.limited = false;
+    L.click_us = now;
+    portEXIT_CRITICAL(&lab_mux);
+    portENTER_CRITICAL(&drive_mux);
+    D.owner = who, D.owner_us = now, D.moving_us = now;
+    strlcpy(D.src, "lab", sizeof D.src);
+    D.commands++;
+    portEXIT_CRITICAL(&drive_mux);
+    return "{\"lab\":\"ok\"}";
+}
+
+// Every control tick: the model one step on; the wanted speed and acceleration per wheel out. False once at rest.
+static bool lab_step(float dt, float v_out[2], float a_out[2]) {
+    v_out[0] = v_out[1] = a_out[0] = a_out[1] = 0;
+    portENTER_CRITICAL(&lab_mux);
+    if (L.active && esp_timer_get_time() - L.click_us > LAB_IDLE_S * 1000000LL) {
+        for (int s = 0; s < 2; s++) L.tgt[s] = L.x[s], L.v[s] = 0;
+        L.active = false;
+    }
+    bool active = L.active;
+    if (active) {
+        float kp = lab_cfg.kp, kd = 2 * lab_cfg.zeta * sqrtf(kp), top = wheels_top_speed();
+        // A stiff model (high Kp or damping) needs smaller steps than the control tick to stay stable: sub-steps
+        // with (sqrt(Kp) + kd) * h <= 0.2.
+        int n = (int)ceilf((sqrtf(kp) + kd) * dt / 0.2f);
+        n = n < 1 ? 1 : n > 50 ? 50 : n;
+        float h = dt / n;
+        bool still = true;
+        for (int s = 0; s < 2; s++) {
+            float v0 = L.v[s];
+            for (int k = 0; k < n; k++) {
+                float a = kp * (L.tgt[s] - L.x[s]) - kd * L.v[s];
+                if (fabsf(a) > LAB_ACCEL) a = copysignf(LAB_ACCEL, a), L.limited = true;
+                float v = L.v[s] + a * h;
+                if (fabsf(v) > top) v = copysignf(top, v), L.limited = true;
+                L.v[s] = v;
+                L.x[s] += v * h;
+            }
+            a_out[s] = (L.v[s] - v0) / dt;
+            v_out[s] = L.v[s];
+            still &= fabsf(L.tgt[s] - L.x[s]) < 0.5f && fabsf(L.v[s]) < 2;
+        }
+        if (still) {           // settled: exactly on target, and let go
+            for (int s = 0; s < 2; s++) L.x[s] = L.tgt[s], L.v[s] = v_out[s] = a_out[s] = 0;
+            L.active = active = false;
+        }
+    }
+    portEXIT_CRITICAL(&lab_mux);
+    return active;
+}
+
+// Starts (true) or stops the calibration: only for whoever has control, and with the robot standing still. It runs on
+// when that page goes away (a hidden tab lets go of its connection); STOP, any drive command or a change of control
+// ends it.
+static const char *calibrate(int who, bool start) {
+    if (!start) { wheels_cal_abort("asked to"); return "{\"cal\":\"stopped\"}"; }
+    if (!closer_access_has(who)) return "{\"need\":1}";
+    portENTER_CRITICAL(&drive_mux);
+    bool still = D.out[0] == 0 && D.out[1] == 0 && D.target[0] == 0 && D.target[1] == 0;
+    portEXIT_CRITICAL(&drive_mux);
+    if (!still) return "{\"cal\":\"moving\"}";
+    return wheels_cal_start() ? "{\"cal\":\"started\"}" : "{\"cal\":\"running\"}";
+}
+
+// Every 10 ms: the encoders, the dead-man stop, the ramp, then the motors: in power mode the ramped command is the
+// power; in speed mode it is the wheel speed (times the top speed found by the calibration), held by wheels_control;
+// during a calibration the calibration drives.
 static void control_task(void *arg) {
     const float dt = 1.0f / CONTROL_HZ;
     bool held = false;
+    int was = -1;                    // what drove the last tick: 0 power, 1 speed, 2 calibration, 3 lab
+    float prev[2] = {0, 0};
+    TickType_t wake = xTaskGetTickCount();
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(1000 / CONTROL_HZ));
+        vTaskDelayUntil(&wake, pdMS_TO_TICKS(1000 / CONTROL_HZ));
         int64_t now = esp_timer_get_time();
+        wheels_sample(now);
         float out[2];
         portENTER_CRITICAL(&drive_mux);
         if ((D.target[0] != 0 || D.target[1] != 0) && now - D.cmd_us > DEADMAN_MS * 1000LL) {
@@ -280,8 +439,50 @@ static void control_task(void *arg) {
         if (D.out[0] != 0 || D.out[1] != 0) D.moving_us = now;
         out[0] = D.out[0], out[1] = D.out[1];
         portEXIT_CRITICAL(&drive_mux);
-        motor_write(0, out[0]);
-        motor_write(1, out[1]);
+        int how = wheels_cal_running() ? 2 : enc_fault >= 0 ? 0 : drive_mode == MODE_SPEED ? 1 : drive_mode == MODE_LAB ? 3 : 0;
+        if (how != was) {
+            wheels_ctl_reset();
+            if (how == 3 || was == 3) lab_reset();
+            prev[0] = out[0], prev[1] = out[1];
+            was = how;
+        }
+        float duty[2];
+        if (how == 2) {
+            wheels_cal_step(dt, duty);
+            motor_duty(0, duty[0]);
+            motor_duty(1, duty[1]);
+            portENTER_CRITICAL(&drive_mux);
+            D.moving_us = now;               // (no Wi-Fi scans meanwhile)
+            portEXIT_CRITICAL(&drive_mux);
+        } else if (how == 1 || how == 3) {
+            float v[2], a[2], top = wheels_top_speed();
+            if (how == 3) {
+                if (lab_step(dt, v, a)) {
+                    portENTER_CRITICAL(&drive_mux);
+                    D.moving_us = now;
+                    portEXIT_CRITICAL(&drive_mux);
+                }
+            } else {
+                for (int s = 0; s < 2; s++) v[s] = out[s] * top, a[s] = (out[s] - prev[s]) / dt * top;
+            }
+            int bad = wheels_control(v, a, dt, duty);
+            if (bad >= 0) {
+                ESP_LOGW(TAG, "%s mode: the %s wheel doesn't follow; power mode until chosen again",
+                         how == 3 ? "Lab" : "Speed", bad ? "right" : "left");
+                lab_stop();
+                enc_fault = bad;
+                portENTER_CRITICAL(&drive_mux);
+                D.x = D.y = D.target[0] = D.target[1] = D.out[0] = D.out[1] = 0;
+                portEXIT_CRITICAL(&drive_mux);
+            }
+            motor_duty(0, duty[0]);
+            motor_duty(1, duty[1]);
+        } else {
+            float tl = cfg.trim < 0 ? 1 + cfg.trim / 100.0f : 1, tr = cfg.trim > 0 ? 1 - cfg.trim / 100.0f : 1;
+            motor_write(0, out[0] * tl);
+            motor_write(1, out[1] * tr);
+        }
+        prev[0] = out[0], prev[1] = out[1];
         bool hold = driving_recently();
         if (hold != held) { closer_demo_roaming_hold(hold); held = hold; }
     }
@@ -297,7 +498,12 @@ static void display_drive(float *left, float *right, bool *bluetooth) {
 }
 
 // {"drive":1,"x","y","l","r","src","driver":"you"|"other"|"none","access":"you"|"other"|"none","code":seconds the
-// control code is still shown (0: none),"max",...,"display":"ssd1306 0x3c" or ""}: for the pages (10 a second while moving).
+// control code is still shown (0: none),"max",...,"display":"ssd1306 0x3c" or "","mode":"power"|"speed","fault":
+// "left"|"right"|"" (speed mode stopped: power until chosen again),"cal":"idle"|"running"|..,"calibrated":0|1,
+// "vl","vr" (measured, mm/s),"top" (mm/s for a full command in speed mode),"lab_kp","lab_zeta","lab":{"on" (moving),
+// "lim" (the model was held to the robot's limits),"s","st" (distance and its target, mm),"h","ht" (heading and its
+// target, degrees, anticlockwise +; both since lab mode began)}}: for the pages (10 a second while moving).
+#define DRIVE_JSON_LEN 800
 static int drive_json(char *out, size_t len, int viewer) {
     portENTER_CRITICAL(&drive_mux);
     int64_t now = esp_timer_get_time();
@@ -309,7 +515,7 @@ static int drive_json(char *out, size_t len, int viewer) {
     bool dm = D.stopped_by_deadman, ble_driver = owned && D.owner >= OWNER_BLE;
     uint32_t refused = D.refused, stops = D.deadman_stops;
     portEXIT_CRITICAL(&drive_mux);
-    return snprintf(out, len, "{\"drive\":1,\"access\":\"%s\",\"code\":%d,"
+    int n = snprintf(out, len, "{\"drive\":1,\"access\":\"%s\",\"code\":%d,"
                     "\"x\":%.2f,\"y\":%.2f,\"l\":%.2f,\"r\":%.2f,\"src\":\"%s\",\"driver\":\"%s\","
                     "\"via\":\"%s\",\"deadman\":%s,\"deadman_stops\":%lu,\"refused\":%lu,\"max\":%u,\"accel\":%u,\"trim\":%d,"
                     "\"rev_left\":%u,\"rev_right\":%u,\"min\":%u,\"ble\":%d,\"ble_code\":%s,\"fw\":\"%s\",\"host\":\"%s\",\"display\":\"%s\"}",
@@ -318,6 +524,22 @@ static int drive_json(char *out, size_t len, int viewer) {
                     (unsigned long)refused, cfg.max_pct, cfg.accel_pct, cfg.trim, cfg.rev_left, cfg.rev_right, cfg.min_pct,
                     closer_ble_running() ? closer_ble_connections() : -1, ble_code[0] ? "true" : "false",
                     closer_demo_version(), closer_demo_name(), display_found());
+    n--;                             // (over the closing brace)
+    n += snprintf(out + n, len - n, ",\"mode\":\"%s\",\"fault\":\"%s\",\"cal\":\"%s\",\"calibrated\":%d,"
+                  "\"vl\":%.0f,\"vr\":%.0f,\"top\":%.0f}", MODE_NAMES[drive_mode],
+                  enc_fault < 0 ? "" : enc_fault ? "right" : "left", wheels_cal_running() ? "running" : "idle",
+                  wheels_params()->valid, wheels_speed(0), wheels_speed(1), wheels_top_speed());
+    n--;
+    float pl = wheels_position(0), pr = wheels_position(1);
+    portENTER_CRITICAL(&lab_mux);
+    float ml = pl - L.origin[0], mr = pr - L.origin[1], tl = L.tgt[0] - L.origin[0], tr = L.tgt[1] - L.origin[1];
+    bool on = L.active, lim = L.limited;
+    portEXIT_CRITICAL(&lab_mux);
+    const float deg = 180 / (float)M_PI / WHEEL_BASE_MM;
+    n += snprintf(out + n, len - n, ",\"lab_kp\":%.2f,\"lab_zeta\":%.2f,\"lab\":{\"on\":%d,\"lim\":%d,\"s\":%.0f,"
+                  "\"st\":%.0f,\"h\":%.1f,\"ht\":%.1f}}", lab_cfg.kp, lab_cfg.zeta, on, lim, (ml + mr) / 2,
+                  (tl + tr) / 2, (mr - ml) * deg, (tr - tl) * deg);
+    return n;
 }
 
 // ------------------------------------------------------------------ Wi-Fi signal light
@@ -565,7 +787,7 @@ static void source_colour(const char *src, uint8_t out[3]) {
 }
 
 // The LED: Wi-Fi problems first (the Turtle's patterns); then, while someone drives, the controller's colour, brighter
-// the faster the robot goes (dim while the driver holds it still); a red double blink for 3 s after a dead-man stop
+// the faster the robot goes (dim while it stands still, until DRIVE_HOLD_MS after the last movement); a red double blink for 3 s after a dead-man stop
 // (the commands stopped coming); otherwise the Wi-Fi quality, green - yellow - red.
 static void status_pattern(int64_t now_us, uint8_t out[3]) {
     int64_t t = now_us / 1000;
@@ -575,6 +797,7 @@ static void status_pattern(int64_t now_us, uint8_t out[3]) {
     if (st.phase != CLOSER_WIFI_CONNECTED && st.phase != CLOSER_WIFI_SCANNING) return;
     portENTER_CRITICAL(&drive_mux);
     bool owned = D.owner != -1 && now_us - D.owner_us < LEASE_MS * 1000LL;
+    bool recent = D.moving_us && now_us - D.moving_us < DRIVE_HOLD_MS * 1000LL;
     float speed = fmaxf(fabsf(D.out[0]), fabsf(D.out[1]));
     bool deadman = D.stopped_by_deadman && now_us - D.cmd_us < (DEADMAN_MS + 3000) * 1000LL;
     char src[16];
@@ -584,7 +807,7 @@ static void status_pattern(int64_t now_us, uint8_t out[3]) {
         int k = t % 1000;
         bool on = k < 100 || (k >= 200 && k < 300);
         out[0] = on ? 255 : 0, out[1] = out[2] = 0;
-    } else if (owned || speed > 0.01f) {
+    } else if (owned || recent || speed > 0.01f) {
         uint8_t c[3];
         source_colour(src, c);
         float k = 0.25f + 0.75f * fminf(1.0f, speed / (cfg.max_pct / 100.0f));
@@ -1137,9 +1360,14 @@ static void ble_command(int conn, const char *text) {
     cJSON *j = cJSON_Parse(text);
     if (!j) return;
     cJSON *x = cJSON_GetObjectItem(j, "x"), *y = cJSON_GetObjectItem(j, "y"), *src = cJSON_GetObjectItem(j, "src"),
-          *set = cJSON_GetObjectItem(j, "set");
+          *set = cJSON_GetObjectItem(j, "set"), *cal = cJSON_GetObjectItem(j, "calibrate"),
+          *lab = cJSON_GetObjectItem(j, "lab");
     if (cJSON_GetObjectItem(j, "stop")) {
         drive_command(OWNER_BLE + conn, 0, 0, NULL);           // anyone may stop it
+    } else if (cJSON_IsString(lab)) {
+        closer_ble_notify(conn, lab_click(OWNER_BLE + conn, lab->valuestring));
+    } else if (cJSON_IsNumber(cal) || cJSON_IsBool(cal)) {
+        closer_ble_notify(conn, calibrate(OWNER_BLE + conn, cJSON_IsTrue(cal) || (cJSON_IsNumber(cal) && cal->valueint)));
     } else if (!ble_authed(conn)) {
         closer_ble_notify(conn, "{\"auth\":0,\"need\":1}");
     } else if (cJSON_IsObject(set)) {
@@ -1247,7 +1475,7 @@ static void drive_stream_task(void *arg) {
         for (int i = 0; i < MAX_STREAMS; i++) if (stream_fds[i] >= 0) fds[count++] = stream_fds[i];
         portEXIT_CRITICAL(&stream_mux);
         for (int k = 0; k < count && server; k++) {
-            char buf[480];
+            char buf[DRIVE_JSON_LEN];
             int n = drive_json(buf, sizeof buf, fds[k]);
             httpd_ws_frame_t frame = {.type = HTTPD_WS_TYPE_TEXT, .payload = (uint8_t *)buf, .len = n};
             if (httpd_ws_get_fd_info(server, fds[k]) != HTTPD_WS_CLIENT_WEBSOCKET || ws_send(fds[k], &frame) != ESP_OK) {
@@ -1326,12 +1554,14 @@ static esp_err_t drive_http(httpd_req_t *req) {
             }
         }
     }
-    char out[480];
+    char out[DRIVE_JSON_LEN];
     drive_json(out, sizeof out, OWNER_HTTP);
     return send_json(req, out);
 }
 
-// Settings from JSON: {"max":100,"accel":25,"trim":0,"rev_left":0,"rev_right":0,"min":10,"ble_code":"..."}; any subset.
+// Settings from JSON: {"max":100,"accel":25,"trim":0,"rev_left":0,"rev_right":0,"min":10,"mode":"power"|"speed"|"lab",
+// "lab_kp":39.5 (1/s^2),"lab_zeta":0.7,
+// "kp":..,"ki":.. (speed control gains, also set by the calibration),"ble_code":"..."}; any subset.
 // The callers check control first; "ble_code" only from a holder with the server's grant (an admin through the site).
 static void settings_from(cJSON *j) {
     cJSON *v;
@@ -1341,11 +1571,38 @@ static void settings_from(cJSON *j) {
     if ((v = cJSON_GetObjectItem(j, "rev_left")) && cJSON_IsNumber(v)) cfg.rev_left = v->valueint != 0;
     if ((v = cJSON_GetObjectItem(j, "rev_right")) && cJSON_IsNumber(v)) cfg.rev_right = v->valueint != 0;
     if ((v = cJSON_GetObjectItem(j, "min")) && cJSON_IsNumber(v) && v->valueint >= 0 && v->valueint <= 60) cfg.min_pct = v->valueint;
+    if ((v = cJSON_GetObjectItem(j, "mode")) && cJSON_IsString(v)) {
+        for (int m = 0; m < sizeof MODE_NAMES / sizeof MODE_NAMES[0]; m++)
+            if (strcmp(v->valuestring, MODE_NAMES[m]) == 0) {
+                if (m != drive_mode) lab_stop();
+                drive_mode = m;
+                enc_fault = -1;
+            }
+    }
+    if ((v = cJSON_GetObjectItem(j, "lab_kp")) && cJSON_IsNumber(v) && v->valuedouble >= 0.5 && v->valuedouble <= 10000)
+        lab_cfg.kp = v->valuedouble;
+    if ((v = cJSON_GetObjectItem(j, "lab_zeta")) && cJSON_IsNumber(v) && v->valuedouble >= 0 && v->valuedouble <= 5) {
+        lab_cfg.zeta = v->valuedouble;
+    }
+    cJSON *kp = cJSON_GetObjectItem(j, "kp"), *ki = cJSON_GetObjectItem(j, "ki");
+    if (cJSON_IsNumber(kp) || cJSON_IsNumber(ki))
+        wheels_set_gains(cJSON_IsNumber(kp) ? kp->valuedouble : NAN, cJSON_IsNumber(ki) ? ki->valuedouble : NAN);
     if ((v = cJSON_GetObjectItem(j, "ble_code")) && cJSON_IsString(v)) {
         size_t n = strlen(v->valuestring);
         if (n == 0 || (n >= 6 && n < sizeof ble_code)) strlcpy(ble_code, v->valuestring, sizeof ble_code);
     }
     settings_save();
+}
+
+// GET /api/wheels: the encoders, odometry and the speed control's parameters (wheels_json); polled by the robot's page
+// during a calibration.
+static esp_err_t wheels_get(httpd_req_t *req) {
+    char *out = malloc(2048);
+    if (!out) return httpd_resp_send_500(req);
+    wheels_json(out, 2048);
+    esp_err_t e = send_json(req, out);
+    free(out);
+    return e;
 }
 
 // POST /api/settings with a JSON body (see settings_from); needs control (http_control).
@@ -1369,15 +1626,16 @@ static esp_err_t settings_post(httpd_req_t *req) {
     if (!closer_access_by_grant(OWNER_HTTP)) cJSON_DeleteItemFromObject(j, "ble_code");   // (the fixed code: admins only)
     settings_from(j);
     cJSON_Delete(j);
-    char out[480];
+    char out[DRIVE_JSON_LEN];
     drive_json(out, sizeof out, OWNER_HTTP);
     return send_json(req, out);
 }
 
 // WebSocket /ws. Text frames: "stream" (the live state: Wi-Fi twice a second, the drive state up to 10 a second);
 // {"access":..} (control, closer_access.h; the answer comes back); {"x":..,"y":..,"src":"touch"} a drive command;
-// {"stop":1}; {"set":{settings}}. Driving and settings need control: without it {"need":1} comes back; a command
-// refused for another reason (someone else drives) gets {"busy":1}.
+// {"stop":1}; {"set":{settings}}; {"lab":"fwd"|"back"|"left"|"right"} (lab mode's buttons, see lab_click); {"calibrate":1|0} (start or stop the wheel calibration, see wheels.c; the answer
+// {"cal":"started"|"moving"|"running"|"stopped"}). Driving, settings and calibrating need control: without it {"need":1}
+// comes back; a command refused for another reason (someone else drives) gets {"busy":1}.
 static esp_err_t ws_handler(httpd_req_t *req) {
     if (req->method == HTTP_GET) { touch(req); return ESP_OK; }      // the handshake
     httpd_ws_frame_t frame = {.type = HTTPD_WS_TYPE_TEXT};
@@ -1399,17 +1657,22 @@ static esp_err_t ws_handler(httpd_req_t *req) {
     cJSON *j = cJSON_Parse(buf);
     if (!j) return ESP_OK;
     cJSON *x = cJSON_GetObjectItem(j, "x"), *y = cJSON_GetObjectItem(j, "y"), *src = cJSON_GetObjectItem(j, "src"),
-          *set = cJSON_GetObjectItem(j, "set");
+          *set = cJSON_GetObjectItem(j, "set"), *cal = cJSON_GetObjectItem(j, "calibrate"),
+          *lab = cJSON_GetObjectItem(j, "lab");
     const char *answer = NULL;
     if (cJSON_GetObjectItem(j, "stop")) {
         drive_command(fd, 0, 0, NULL);
+    } else if (cJSON_IsString(lab)) {
+        answer = lab_click(fd, lab->valuestring);
+    } else if (cJSON_IsNumber(cal) || cJSON_IsBool(cal)) {
+        answer = calibrate(fd, cJSON_IsTrue(cal) || (cJSON_IsNumber(cal) && cal->valueint));
     } else if (cJSON_IsObject(set)) {
         if (!closer_access_by_grant(fd)) cJSON_DeleteItemFromObject(set, "ble_code");   // (the fixed code: admins only)
         if (closer_access_has(fd)) settings_from(set);
         else answer = "{\"need\":1}";
     } else if (cJSON_IsNumber(x) && cJSON_IsNumber(y)) {
         if (!drive_command(fd, (float)x->valuedouble, (float)y->valuedouble, cJSON_IsString(src) ? src->valuestring : ""))
-            answer = closer_access_has(fd) ? "{\"busy\":1}" : "{\"need\":1}";
+            answer = !closer_access_has(fd) ? "{\"need\":1}" : drive_mode == MODE_LAB ? "{\"lab\":\"buttons\"}" : "{\"busy\":1}";
     }
     if (answer) {
         httpd_ws_frame_t r = {.type = HTTPD_WS_TYPE_TEXT, .payload = (uint8_t *)answer, .len = strlen(answer)};
@@ -1430,7 +1693,7 @@ static void web_start(void) {
     httpd_config_t c = HTTPD_DEFAULT_CONFIG();
     c.lru_purge_enable = true;
     c.stack_size = 6144;
-    c.max_uri_handlers = 24;       // (18 in use: 12 here, 3 for the Wi-Fi settings page, 3 for the UDP test)
+    c.max_uri_handlers = 24;       // (19 in use: 13 here, 3 for the Wi-Fi settings page, 3 for the UDP test)
     c.send_wait_timeout = 2;       // a stalled viewer must not hold the others up for long
     c.close_fn = on_close;
     httpd_handle_t srv;
@@ -1441,6 +1704,7 @@ static void web_start(void) {
         {.uri = "/api/drive", .method = HTTP_GET, .handler = drive_http},
         {.uri = "/api/drive", .method = HTTP_POST, .handler = drive_http},
         {.uri = "/api/settings", .method = HTTP_POST, .handler = settings_post},
+        {.uri = "/api/wheels", .method = HTTP_GET, .handler = wheels_get},
         {.uri = "/api/wifi", .method = HTTP_GET, .handler = wifi_get},
         {.uri = "/api/wifi/history", .method = HTTP_GET, .handler = history_get},
         {.uri = "/api/wifi/aps", .method = HTTP_GET, .handler = aps_get},
@@ -1470,6 +1734,8 @@ void app_main(void) {
     if (led_strip_new_rmt_device(&sc, &rc, &strip) != ESP_OK) strip = NULL;
     init_gamma();
     send_lock = xSemaphoreCreateMutex();
+    wheels_init(CONFIG_BESBOT_ENC_LEFT_A_GPIO, CONFIG_BESBOT_ENC_LEFT_B_GPIO, CONFIG_BESBOT_ENC_RIGHT_A_GPIO,
+                CONFIG_BESBOT_ENC_RIGHT_B_GPIO);
     web_start();
     xTaskCreate(led_task, "led", 4096, NULL, 4, NULL);         // (it also measures the Wi-Fi quality)
     survey_lock = xSemaphoreCreateMutex();

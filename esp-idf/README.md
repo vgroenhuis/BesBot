@@ -8,6 +8,26 @@ ESP-IDF 6.1 firmware for the BesBot (ESP32-C5-DevKitC-1 + L298N), replacing the 
   `GET /api/drive`, `POST /api/drive?x=..&y=..` / `?stop=1`, `POST /api/settings` (JSON).
   Dead-man stop 0.5 s after the last command; one driver at a time (lease 1.5 s after its last moving command); speed
   ramp; settings in NVS. Roaming scans, access point scans and firmware updates wait while it drives.
+* **Encoders and drive modes** (since 1.7.0; `main/wheels.c`): quadrature encoders on both motors (48 counts per motor
+  turn, 30:1, 71 mm wheels: 1440 counts and 223 mm per wheel turn; wheel base 262.5 mm), counted by the PCNT. Two
+  modes (`{"set":{"mode":"power"|"speed"}}`, in NVS): *power* is the original (the command sets the motors' power,
+  with minimum power and trim); *speed* makes the command a wheel speed (full command = 90 % of the calibrated top
+  speed), held per wheel every 10 ms by feed-forward (dead zone ks + kv * speed + ka * acceleration) plus PI (kp on
+  the speed error, ki on the position error = the integral of the speed error, limited). If a wheel gets plenty of
+  power but doesn't turn (or turns the wrong way) for 0.4 s, speed mode stops and the robot drives in power mode
+  until speed is chosen again (`"fault"` in the state). Calibration: `{"calibrate":1}` (`0` stops it; so does any
+  drive command or STOP) with control, about 35 s, the robot spinning in place both ways: encoder directions, where
+  the wheels start and stop turning, steps from rest to 25..100 % power (steady speed, time constant), a line fit
+  per wheel and direction (ks, kv), ka = kv * time constant, PI for a closed-loop time constant of 0.12 s (or half
+  the wheel's), then a check at half speed. Kept in NVS (`besbot/wheels`); kp/ki can be changed
+  (`{"set":{"kp":..,"ki":..}}`, duty per mm/s and per mm). `GET /api/wheels`: counts, speeds, odometry, parameters and
+  the last calibration's measurements. The drive state adds `"mode","fault","cal","calibrated","vl","vr","top"`.
+* **Lab position control** (since 1.8.0; mode `"lab"`): `{"lab":"fwd"|"back"|"left"|"right"}` moves the robot 0.5 m
+  or turns it 90 degrees (clicks add up). Each wheel follows a virtual mass-spring-damper, a = Kp (target - x) -
+  2 zeta sqrt(Kp) v (`{"set":{"lab_kp":39.5,"lab_zeta":0.7}}`, NVS `besbot/lab`; Kp 0.5..10000 1/s^2, 39.5 = 1 Hz undamped; stiff settings run the model in up to 50 sub-steps),
+  tracked by the speed control; the model's speed is held to the top speed and its acceleration to 2 m/s^2 ("lim").
+  Drive commands don't move it in this mode; STOP, a change of control or 60 s without a click stop it. The state's
+  `"lab":{"on","lim","s","st","h","ht"}` (distance/heading and targets) feeds the robot page's plot.
 * **Control** (since 1.3.0): one person at a time controls the robot, everyone else watches (`closer_access` in the
   closer_demo component, `components/closer_demo/include/closer_access.h`). Control comes with a code the robot
   shows on request (`{"access":"request"}`, valid 60 s; BesBot: 2 digits, 2 tries a code; on the display and in
@@ -36,7 +56,7 @@ ESP-IDF 6.1 firmware for the BesBot (ESP32-C5-DevKitC-1 + L298N), replacing the 
 * **Pages:** `/` (touch pad, keyboard, settings), `/wifi` (saved networks, band, roaming, Bluetooth on/off), `/udp`. The lab demos site has the full driving page with gamepad, SpaceMouse,
   HandTool and ATLAS (`labdemos/apps/besbot/drive.html` on the server).
 
-Pins (menuconfig, *BesBot*): IN1 9, IN2 10 (left), IN3 25, IN4 26 (right), LED 27.
+Pins (menuconfig, *BesBot*): IN1 9, IN2 10 (left), IN3 25, IN4 26 (right), LED 27; encoders: left A 6, B 7, right A 24, B 23.
 
 Module: ESP32-C5-WROOM N16R8. Since 1.2.0: 16 MB layout (`partitions.csv`: two 4 MB app slots, a core dump partition,
 8 MB `storage` for later), PSRAM on (big allocations, TLS among them, go there; `psram_free` in the stats). Access

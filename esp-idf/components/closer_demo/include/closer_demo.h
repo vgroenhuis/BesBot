@@ -50,6 +50,9 @@ typedef struct {
     char ip[16];          // "" while not connected
     int rssi;             // dBm, 0 when unknown
     bool updating;        // installing a firmware update right now
+    int update_pct;       // while updating: downloaded so far (%)
+    int update_failed_s;  // seconds since the last update failed (-1: none since the start)
+    char update_error[96];// why it failed, e.g. "the download kept breaking off (at 35 %)"
     char note[121];       // the short message shown on the demo page ("update failed ...")
     char wifi[48];        // what Wi-Fi is doing, e.g. "Searching for iotroam", "Joining iotroam (ch 124)",
                           // "Getting an address", "Connected", "Wrong password? (try 3)", "Looking for a better AP"

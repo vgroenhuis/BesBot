@@ -293,11 +293,16 @@ static void draw(int tick) {
     u8g2_ClearBuffer(&u8g2);
     if (st.updating) {
         header("BesBot", &st, true);
-        text_center(29, u8g2_font_helvB12_tr, "Updating");
-        int x = (W - width(u8g2_font_helvB12_tr, "firmware")) / 2;       // (centred without the dots)
-        snprintf(code, sizeof code, "firmware%.*s", tick / 3 % 4, "...");
-        text(x, 45, u8g2_font_helvB12_tr, code);
+        text_center(27, u8g2_font_helvB10_tr, "Updating firmware");
+        snprintf(code, sizeof code, "%d %%", st.update_pct);
+        text_center(41, u8g2_font_helvB10_tr, code);
+        u8g2_DrawRFrame(&u8g2, 0, 45, W, 6, 2);                          // (the download so far)
+        if (st.update_pct > 0) u8g2_DrawBox(&u8g2, 2, 47, (W - 4) * st.update_pct / 100, 2);
         text_center(62, u8g2_font_6x10_tr, "Don't switch off");
+    } else if (st.update_error[0] && st.update_failed_s >= 0 && st.update_failed_s < 60) {
+        // An update that failed: why, for a minute (also on the demo page, with when it tries again).
+        header("Update failed", &st, false);
+        wrapped(0, 24, 10, W - 1, 4, u8g2_font_6x10_tr, st.update_error);
     } else if (left > 0) {
         code_screen(code, left, &st);
     } else if (now_ms() < news_until) {

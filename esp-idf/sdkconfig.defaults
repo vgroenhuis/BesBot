@@ -35,3 +35,6 @@ CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 # A crash leaves a core dump in its partition (read it over USB with idf.py coredump-info)
 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+# Software AES for TLS (1.7.2): the hardware AES's DMA needs bounce buffers in internal RAM, which ran out during
+# firmware downloads ("esp-aes: Failed to allocate memory"; every connection broke off after ~20 KB)
+# CONFIG_MBEDTLS_HARDWARE_AES is not set

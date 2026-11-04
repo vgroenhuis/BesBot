@@ -32,7 +32,26 @@
   a { color:var(--accent); }
   .ctl { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
   .ctl input { font:inherit; width:7em; padding:7px 10px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--fg); letter-spacing:.2em; }
-  .locked canvas, .locked .set { opacity:.45; pointer-events:none; }
+  .locked canvas, .locked .set, .locked .wh { opacity:.45; pointer-events:none; }
+  .seg { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .seg button { border:0; border-radius:0; padding:6px 12px; }
+  .seg button.on { background:var(--accent); color:#fff; }
+  .prog { height:8px; background:var(--line); border-radius:4px; overflow:hidden; margin:8px 0; }
+  .prog b { display:block; height:100%; width:0; background:var(--accent); transition:width .4s; }
+  table.p { border-collapse:collapse; font-variant-numeric:tabular-nums; font-size:.9rem; margin-top:8px; width:100%; }
+  table.p th, table.p td { padding:3px 6px; border-bottom:1px solid var(--line); text-align:right; }
+  table.p th:first-child, table.p td:first-child { text-align:left; }
+  .gains { display:flex; flex-wrap:wrap; gap:8px 16px; margin-top:10px; }
+  .gains input { width:6em; font:inherit; padding:4px 8px; border-radius:6px; border:1px solid var(--line); background:var(--bg); color:var(--fg); }
+  .warn { color:var(--warn); }
+  .labbtn { display:grid; grid-template-columns:repeat(4, 1fr); gap:8px; margin:10px 0; }
+  .labbtn button { font-size:1.05rem; padding:12px 4px; }
+  #labplot { width:100%; height:260px; display:block; }
+  .labset { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; }
+  .labset input { width:6em; font:inherit; padding:4px 8px; border-radius:6px; border:1px solid var(--line); background:var(--bg); color:var(--fg); }
+  .locked .labbtn, .locked .labset { opacity:.45; pointer-events:none; }
+  #zetas button { padding:6px 10px; }
+  #zetas button.on { background:var(--accent); border-color:var(--accent); color:#fff; }
 </style>
 </head>
 <body>
@@ -63,7 +82,30 @@
     <span>Left</span><div class="bar"><b id="lb"></b></div><span id="lv">0 %</span>
     <span>Right</span><div class="bar"><b id="rb"></b></div><span id="rv">0 %</span>
   </div>
-  <p class="muted" id="wifi" style="margin:10px 0 0"></p>
+  <p class="muted" id="speeds" style="margin:8px 0 0"></p>
+  <p class="muted" id="wifi" style="margin:4px 0 0"></p>
+</div>
+
+<div class="card" id="labcard" hidden>
+  <b>Lab position control</b>
+  <div class="labbtn">
+    <button id="labl" type="button">&#8634; 90&deg;</button><button id="labf" type="button">&#8593; 0.5 m</button>
+    <button id="labb" type="button">&#8595; 0.5 m</button><button id="labr" type="button">&#8635; 90&deg;</button>
+  </div>
+  <div class="labset">
+    <label>Kp <input id="lab_kp" type="number" min="0.5" max="10000" step="0.5"> 1/s&sup2;</label>
+    <span class="muted" id="labfn"></span>
+    <label>&zeta; <input id="lab_zeta" type="number" min="0" max="5" step="0.05"></label>
+    <span class="muted" id="labzn"></span>
+  </div>
+  <div class="labset" style="margin-top:8px" id="zetas">
+    <button type="button" data-z="0">&zeta; = 0</button><button type="button" data-z="0.2">&zeta; = 0.2</button>
+    <button type="button" data-z="0.7">&zeta; = 0.7</button><button type="button" data-z="1">&zeta; = 1</button>
+    <button type="button" data-z="3">&zeta; = 3</button>
+  </div>
+  <canvas id="labplot"></canvas>
+  <p class="muted" id="labmsg" style="margin:6px 0 0"></p>
+  <p class="muted" style="margin:6px 0 0">Each wheel follows a mass-spring-damper towards its target: acceleration = Kp &middot; (target &minus; position) &minus; 2&zeta;&radic;Kp &middot; speed. Natural frequency &radic;Kp/2&pi; (Kp 39.5: 1 Hz). &zeta; = 0 undamped (it keeps swinging), below 1 underdamped (overshoot), 1 critically damped, above 1 overdamped (slow). Clicks add up; STOP stops it. The robot can't go faster than about 0.6 m/s or accelerate faster than 2 m/s&sup2;: where the model asks for more it is held to that (&ldquo;limited&rdquo;), so big steps overshoot less than the linear theory says.</p>
 </div>
 
 <div class="card" id="setcard">
@@ -73,10 +115,37 @@
       <label><span>Top speed</span><input type="range" id="max" min="10" max="100" step="5"><output id="maxo"></output></label>
       <label><span>Acceleration</span><input type="range" id="accel" min="2" max="100" step="1"><output id="accelo"></output></label>
       <label><span>Trim (pulls right: +)</span><input type="range" id="trim" min="-20" max="20" step="1"><output id="trimo"></output></label>
-      <label><span>Minimum power</span><input type="range" id="min" min="0" max="60" step="5"><output id="mino"></output></label>
+      <label><span>Minimum power</span><input type="range" id="min" min="0" max="60" step="1"><output id="mino"></output></label>
       <label><input type="checkbox" id="rev_left"> Left motor runs backwards (reverse it)</label>
       <label><input type="checkbox" id="rev_right"> Right motor runs backwards (reverse it)</label>
-      <p class="muted" style="margin:0">Acceleration: how much the speed may change per 0.1 s (100 %: at once). Minimum power: the motors start at this power instead of humming at low settings. Saved on the robot.</p>
+      <p class="muted" style="margin:0">Acceleration: how much the speed may change per 0.1 s (100 %: at once). Minimum power and trim: power mode only. Saved on the robot.</p>
+    </div>
+  </details>
+</div>
+
+<div class="card" id="whcard">
+  <details id="whdetails">
+    <summary>Drive mode and wheel calibration</summary>
+    <div class="wh">
+      <div class="row" style="margin-top:10px">
+        <span>Drive mode</span>
+        <span class="seg"><button id="mpower" type="button">Power</button><button id="mspeed" type="button">Speed (encoders)</button><button id="mlab" type="button">Lab position control</button></span>
+      </div>
+      <p class="muted" id="modenote" style="margin:6px 0 0"></p>
+      <div class="row" style="margin-top:12px">
+        <button class="primary" id="calgo" type="button">Calibrate</button>
+        <button id="calstop" type="button" hidden>Stop calibrating</button>
+        <span class="muted" id="calmsg"></span>
+      </div>
+      <div class="prog" id="calprog" hidden><b></b></div>
+      <p class="muted" style="margin:6px 0 0">The calibration takes about 35 s. The robot spins in place, both ways, up to full speed: put it on the floor with half a metre free around it (or lift it, but the floor gives values that fit driving better). STOP ends it.</p>
+      <table class="p" id="caltab"></table>
+      <div class="gains">
+        <label>kp <input id="kp" type="number" step="0.01" min="0"> % per 100 mm/s</label>
+        <label>ki <input id="ki" type="number" step="0.01" min="0"> % per mm</label>
+        <button id="usemin" type="button">Use the dead zone as minimum power</button>
+      </div>
+      <p class="muted" id="enc" style="margin:8px 0 0"></p>
     </div>
   </details>
 </div>
@@ -138,6 +207,8 @@ function connect() {
     if (j.busy) { $("driver").textContent = "Someone else is driving: wait until they stop."; return; }
     if (j.need) { ctl.msg = "You don't have control (any more): ask for it again."; showCtl(); return; }
     if (j.access && !j.drive) { onAccess(j); return; }
+    if (j.lab && !j.drive) { $("labmsg").textContent = { mode: "Choose Lab position control first.", cal: "Wait for the calibration to end.", buttons: "In lab mode the buttons move the robot." }[j.lab] || $("labmsg").textContent; return; }
+    if (j.cal && !j.drive) { $("calmsg").textContent = { moving: "Stop the robot first.", running: "Already calibrating." }[j.cal] || ""; calPoll(true); return; }
     if (j.drive) { state = j; showDrive(); showCtl(); }
     else if (j.wifi) showWifi(j);
   };
@@ -169,7 +240,7 @@ function showCtl() {
   $("ctlmsg").textContent = ctl.msg || (mine ? "You can drive and change the settings. Control ends when you release it, close the page, or after 10 minutes without driving." :
     state.code ? `A code is on the robot's display for ${state.code} s more.` :
     "One person controls the robot at a time; everyone can watch. To drive, ask for control and type the code the robot shows. Stop works for everyone.");
-  $("drivecard").classList.toggle("locked", !mine); $("setcard").classList.toggle("locked", !mine);
+  $("drivecard").classList.toggle("locked", !mine); $("setcard").classList.toggle("locked", !mine); $("whcard").classList.toggle("locked", !mine); $("labcard").classList.toggle("locked", !mine);
 }
 $("ctlask").onclick = () => { ctl.msg = ""; send({ access: "request" }); };
 $("ctlsend").onclick = () => { const c = $("ctlcode").value.replace(/\D/g, ""); if (c.length >= 2) send({ access: "code", code: c }); };
@@ -188,6 +259,20 @@ function showDrive() {
     s.deadman ? "Stopped: the commands stopped coming." : "Nobody drives.";
   for (const k of ["max", "accel", "trim", "min"]) if (document.activeElement !== $(k)) { $(k).value = s[k]; out(k); }
   $("rev_left").checked = !!s.rev_left; $("rev_right").checked = !!s.rev_right;
+  if (s.mode) {
+    $("mpower").classList.toggle("on", s.mode === "power" || !!s.fault); $("mspeed").classList.toggle("on", s.mode === "speed" && !s.fault);
+    $("mlab").classList.toggle("on", s.mode === "lab" && !s.fault);
+    $("labcard").hidden = s.mode !== "lab" || !!s.fault;
+    if (s.lab) showLab(s);
+    $("speeds").textContent = `Wheel speeds: left ${s.vl} mm/s, right ${s.vr} mm/s` + (s.mode === "speed" ? ` (full command: ${s.top} mm/s)` : "");
+    $("modenote").innerHTML = s.fault ? `<span class="warn">Speed mode stopped: the ${s.fault} wheel didn't follow (stalled, or its encoder isn't counting). It drives in power mode until you choose Speed again.</span>` :
+      s.mode === "lab" ? (s.calibrated ? "The buttons below move the robot 0.5 m or turn it 90° with a second-order response; the pad and other controllers don't drive it in this mode." :
+        '<span class="warn">Not calibrated yet: lab mode uses rough guesses for the wheels. Calibrate first.</span>') :
+      s.mode === "speed" ? (s.calibrated ? "A command sets each wheel's speed; the encoders hold it (straight lines, slow driving, the same on any floor)." :
+        '<span class="warn">Not calibrated yet: speed mode uses rough guesses. Calibrate first.</span>') :
+      "A command sets the motors' power directly (the original mode; the encoders are not used).";
+    if (s.cal === "running") calPoll(true);
+  }
 }
 function showWifi(j) {
   $("wifi").textContent = `Wi-Fi: ${j.text || j.phase}${j.ssid ? ", " + j.ssid : ""}${j.rssi ? ", " + j.rssi + " dBm" : ""}${j.rtt != null ? ", ping " + j.rtt + " ms" : ""}${j.loss ? ", " + j.loss + " % lost" : ""}`;
@@ -197,6 +282,90 @@ for (const k of ["max", "accel", "trim", "min"]) {
   $(k).oninput = () => out(k);
   $(k).onchange = () => send({ set: { [k]: +$(k).value } });
 }
+// Drive mode and calibration (GET api/wheels: the encoders and the speed control's parameters).
+$("mpower").onclick = () => send({ set: { mode: "power" } });
+$("mspeed").onclick = () => send({ set: { mode: "speed" } });
+$("mlab").onclick = () => send({ set: { mode: "lab" } });
+
+// Lab position control: the buttons, Kp and zeta, and a plot of the last 15 s (distance and heading, target dashed).
+for (const [id, what] of [["labl", "left"], ["labf", "fwd"], ["labb", "back"], ["labr", "right"]]) $(id).onclick = () => send({ lab: what });
+for (const k of ["lab_kp", "lab_zeta"]) $(k).onchange = () => { const v = +$(k).value; if ($(k).value !== "" && v >= 0) send({ set: { [k]: v } }); };
+for (const b of $("zetas").children) b.onclick = () => send({ set: { lab_zeta: +b.dataset.z } });
+const labHist = [];
+function zetaName(z) { return z === 0 ? "undamped" : z < 1 ? "underdamped" : z === 1 ? "critically damped" : "overdamped"; }
+function showLab(s) {
+  for (const k of ["lab_kp", "lab_zeta"]) if (document.activeElement !== $(k)) $(k).value = s[k];
+  $("labfn").textContent = `natural frequency ${(Math.sqrt(s.lab_kp) / 2 / Math.PI).toFixed(2)} Hz`;
+  $("labzn").textContent = zetaName(s.lab_zeta);
+  for (const b of $("zetas").children) b.classList.toggle("on", Math.abs(+b.dataset.z - s.lab_zeta) < 0.001);
+  const L = s.lab, now = performance.now() / 1000;
+  labHist.push([now, L.s, L.st, L.h, L.ht]);
+  while (labHist.length && labHist[0][0] < now - 15) labHist.shift();
+  $("labmsg").textContent = (L.on ? "Moving" : "At rest") + ` · distance ${L.s} mm (target ${L.st}) · heading ${L.h}° (target ${L.ht}°)` +
+    (L.lim ? " · limited by the robot's speed or acceleration" : "");
+  drawLab(now);
+}
+function drawLab(now) {
+  const c = $("labplot"), r = c.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+  c.width = r.width * dpr; c.height = r.height * dpr;
+  const g = c.getContext("2d"), cs = getComputedStyle(document.documentElement), W = r.width, H = r.height;
+  g.scale(dpr, dpr); g.font = "11px system-ui"; g.lineWidth = 1.5;
+  const panels = [["distance (mm)", 1, 2, "--accent"], ["heading (°)", 3, 4, "--ok"]], ph = (H - 10) / 2;
+  panels.forEach(([name, ia, it, col], p) => {
+    const top = 4 + p * (ph + 2), bot = top + ph - 14, left = 44, right = W - 6;
+    let lo = Infinity, hi = -Infinity;
+    for (const h of labHist) { lo = Math.min(lo, h[ia], h[it]); hi = Math.max(hi, h[ia], h[it]); }
+    if (!isFinite(lo)) lo = 0, hi = 1;
+    if (hi - lo < (p ? 10 : 50)) { const m = (hi + lo) / 2, d = p ? 5 : 25; lo = m - d; hi = m + d; }
+    const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
+    const X = (t) => left + (t - (now - 15)) / 15 * (right - left), Y = (v) => bot - (v - lo) / (hi - lo) * (bot - top);
+    g.strokeStyle = cs.getPropertyValue("--line"); g.strokeRect(left, top, right - left, bot - top);
+    g.fillStyle = cs.getPropertyValue("--muted");
+    g.fillText(name, left + 4, top + 12); g.fillText(Math.round(hi - pad), 2, top + 10); g.fillText(Math.round(lo + pad), 2, bot);
+    for (const [i, dash, colour] of [[it, [5, 4], "--muted"], [ia, [], col]]) {
+      g.setLineDash(dash); g.strokeStyle = cs.getPropertyValue(colour); g.beginPath();
+      labHist.forEach((h, k) => k ? g.lineTo(X(h[0]), Y(h[i])) : g.moveTo(X(h[0]), Y(h[i]))); g.stroke();
+    }
+    g.setLineDash([]);
+  });
+  g.fillStyle = cs.getPropertyValue("--muted"); g.fillText("last 15 s", W - 56, H - 2);
+}
+$("calgo").onclick = () => send({ calibrate: 1 });
+$("calstop").onclick = () => send({ calibrate: 0 });
+let wheels = null, calTimer = null;
+const pct = (v, d = 0) => (v * 100).toFixed(d);
+function showWheels(w) {
+  wheels = w; const p = w.params, run = w.state === "running";
+  $("calgo").hidden = run; $("calstop").hidden = !run; $("calprog").hidden = !run;
+  $("calprog").firstElementChild.style.width = w.progress + "%";
+  $("calmsg").textContent = w.msg || (p.valid ? `Calibrated ${new Date(p.when * 1000).toLocaleString()}.` : "Not calibrated yet.");
+  const row = (name, f, unit) => `<tr><td>${name}</td><td>${f(0, 0)}</td><td>${f(0, 1)}</td><td>${f(1, 0)}</td><td>${f(1, 1)}</td><td>${unit}</td></tr>`;
+  $("caltab").innerHTML = `<tr><th></th><th>left fwd</th><th>left back</th><th>right fwd</th><th>right back</th><th></th></tr>` +
+    row("Starts turning at", (s, d) => pct(p.start[s][d]), "% power") +
+    row("Dead zone (ks)", (s, d) => pct(p.ks[s][d], 1), "% power") +
+    row("kv", (s, d) => (p.kv[s][d] * 1e4).toFixed(2), "% per 100 mm/s") +
+    row("Time constant", (s) => Math.round(p.tau[s] * 1000), "ms") +
+    row("ka", (s) => (p.ka[s] * 1e5).toFixed(2), "% per m/s²") +
+    `<tr><td>Top speed</td><td colspan="4">${p.vmax} mm/s at full power · ${p.top} mm/s for a full command</td><td></td></tr>` +
+    (p.check[0] >= 0 ? `<tr><td>Check (half speed)</td><td colspan="4">speed error ${p.check[0]} / ${p.check[1]} mm/s RMS</td><td></td></tr>` : "") +
+    `<tr><td>Encoders</td><td colspan="4">left ${p.enc_sign[0] > 0 ? "as wired" : "reversed"}, right ${p.enc_sign[1] > 0 ? "as wired" : "reversed"}</td><td></td></tr>`;
+  for (const [k, f] of [["kp", 1e4], ["ki", 100]]) if (document.activeElement !== $(k)) $(k).value = +(p[k] * f).toFixed(3);
+  $("enc").textContent = `Encoders now: left ${w.enc[0]}, right ${w.enc[1]} counts (1440 per wheel turn) · driven ${(w.odo[3] / 1000).toFixed(2)} m since the start`;
+}
+async function calPoll(fast) {
+  if (calTimer && !fast) return;
+  clearTimeout(calTimer); calTimer = null;
+  try { showWheels(await (await fetch("api/wheels", { cache: "no-store" })).json()); } catch (e) {}
+  const again = (wheels && wheels.state === "running") ? 500 : $("whdetails").open ? 3000 : 0;
+  if (again && !document.hidden) calTimer = setTimeout(() => { calTimer = null; calPoll(false); }, again);
+}
+$("whdetails").addEventListener("toggle", () => { if ($("whdetails").open) calPoll(true); });
+for (const [k, f] of [["kp", 1e4], ["ki", 100]]) $(k).onchange = () => { const v = +$(k).value; if (v >= 0) send({ set: { [k]: v / f } }); };
+$("usemin").onclick = () => {
+  if (!wheels) return;
+  const ks = wheels.params.ks.flat(), m = Math.round(Math.max(...ks) * 100);
+  if (confirm(`Set the minimum power (power mode) to ${m} %?`)) send({ set: { min: m } });
+};
 for (const k of ["rev_left", "rev_right"]) $(k).onchange = () => send({ set: { [k]: $(k).checked ? 1 : 0 } });
 
 // The pad: a circle; the knob follows the finger, up = forward, right = turn right.

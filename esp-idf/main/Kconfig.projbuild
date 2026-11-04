@@ -11,6 +11,18 @@ menu "BesBot"
     config BESBOT_IN4_GPIO
         int "GPIO to L298N IN4 (right motor, backward)"
         default 26
+    config BESBOT_ENC_LEFT_A_GPIO
+        int "GPIO to the left motor's encoder A"
+        default 6
+    config BESBOT_ENC_LEFT_B_GPIO
+        int "GPIO to the left motor's encoder B"
+        default 7
+    config BESBOT_ENC_RIGHT_A_GPIO
+        int "GPIO to the right motor's encoder A"
+        default 24
+    config BESBOT_ENC_RIGHT_B_GPIO
+        int "GPIO to the right motor's encoder B"
+        default 23
     config BESBOT_MAX_PCT
         int "Default top speed in percent (changeable on the page)"
         default 100
