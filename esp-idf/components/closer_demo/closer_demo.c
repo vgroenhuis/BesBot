@@ -373,14 +373,20 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         S.phase = CLOSER_WIFI_SEARCHING;
         S.down_since_us = esp_timer_get_time();
         set_wifi_state("Searching for %s", S.ssid);
-        // First only the channel of the last connection (well under a second, instead of ~20 s for all channels with
-        // Bluetooth on); on failure the next attempt scans them all.
+        // First only the channel of the last connection, or of the chosen access point (well under a second, instead
+        // of ~20 s for all channels with Bluetooth on); when that network isn't there, one scan for all saved networks
+        // (seek_task). Without a channel to try: that scan straight away when more networks are saved (since 1.8.9:
+        // a robot taken elsewhere spent ~30 s on the old network first).
         wifi_config_t wc;
-        if (S.boot_channel && !S.pin_bssid[0] && esp_wifi_get_config(WIFI_IF_STA, &wc) == ESP_OK) {
-            wc.sta.channel = S.boot_channel;
+        int ch = S.pin_bssid[0] ? S.pin_channel : S.boot_channel;
+        if (ch && esp_wifi_get_config(WIFI_IF_STA, &wc) == ESP_OK) {
+            wc.sta.channel = ch;
             wc.sta.scan_method = WIFI_FAST_SCAN;
             esp_wifi_set_config(WIFI_IF_STA, &wc);
-            set_wifi_state("Joining %s (ch %d)", S.ssid, S.boot_channel);
+            set_wifi_state("Joining %s (ch %d)", S.ssid, ch);
+        } else if (nets_n > 1 && seek_h) {
+            xTaskNotifyGive(seek_h);         // (it connects)
+            return;
         }
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
@@ -411,7 +417,10 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         // Network not found (moved elsewhere?): one scan for all saved networks, like a phone, instead of trying them
         // one by one (6 tries of ~20 s each). Not for the quick try on the channel of a connection just lost.
         bool quick_next = S.ever_connected && S.last_channel && S.attempts <= 2;
-        if (!S.roam_pending && !S.switching && e->reason == WIFI_REASON_NO_AP_FOUND && nets_n > 1 && !quick_next && seek_h) {
+        bool not_found = e->reason == WIFI_REASON_NO_AP_FOUND || e->reason == WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY ||
+                         e->reason == WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD ||
+                         e->reason == WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD;   // (all "not in range here")
+        if (!S.roam_pending && !S.switching && not_found && nets_n > 1 && !quick_next && seek_h) {
             xTaskNotifyGive(seek_h);         // (it connects)
             return;
         }
@@ -708,14 +717,24 @@ static void seek_task(void *arg) {
             int pick = -1;
             if (e == ESP_OK) {
                 qsort(recs, n, sizeof *recs, by_rssi);
+                uint8_t pin[6];
+                bool pinned = S.pin_bssid[0] && parse_bssid(S.pin_bssid, pin);
                 for (int i = 0; i < n; i++) {
                     if (find_net((const char *)recs[i].ssid) < 0) continue;
                     if (pick < 0) pick = i;
-                    if (strcmp((const char *)recs[i].ssid, S.ssid) == 0) { pick = i; break; }
+                    if (strcmp((const char *)recs[i].ssid, S.ssid) != 0) continue;
+                    if (pick < 0 || strcmp((const char *)recs[pick].ssid, S.ssid) != 0) pick = i;   // the strongest of it
+                    if (!pinned || memcmp(pin, recs[i].bssid, 6) == 0) { pick = i; break; }        // (or the chosen one)
                 }
             }
             if (pick >= 0 && !closer_demo_wifi_connected() && !S.switching) {
                 const wifi_ap_record_t *r = &recs[pick];
+                uint8_t pin[6];
+                if (S.pin_bssid[0] && (!parse_bssid(S.pin_bssid, pin) || memcmp(pin, r->bssid, 6) != 0)) {
+                    // The chosen access point isn't the one found (not in range): any of the network will do (the
+                    // choice comes back after a restart), or this would try the missing one again and again.
+                    S.pin_bssid[0] = 0;
+                }
                 if (strcmp((const char *)r->ssid, S.ssid) != 0) {
                     const saved_net_t *sn = &nets[find_net((const char *)r->ssid)];
                     ESP_LOGW(TAG, "Saved network %s found (%d dBm, ch %d) instead of %s", sn->ssid, r->rssi, r->primary, S.ssid);

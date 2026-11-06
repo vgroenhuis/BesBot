@@ -12,8 +12,9 @@
 
 static const char *TAG = "closer_access";
 
-#define IDLE_US (10 * 60 * 1000000LL)      // control ends after this long without a control command
-#define RETURN_US (60 * 1000000LL)         // a holder whose connection closed may come back with its token this long
+#define IDLE_US (30 * 60 * 1000000LL)      // control ends after this long without a control command (10 min before BesBot 1.8.11)
+#define RETURN_US (10 * 60 * 1000000LL)    // a holder whose connection closed (tab hidden, phone locked) may come back
+                                           // with its token this long (60 s before BesBot 1.8.11)
 #define CODE_US (60 * 1000000LL)           // a code is shown this long
 #define CODE_TRIES 5
 #define SHORT_CODE_TRIES 2                 // for codes of up to 3 digits

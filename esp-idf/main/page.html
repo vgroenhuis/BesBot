@@ -15,6 +15,7 @@
   .row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; }
   .dot { display:inline-block; width:10px; height:10px; border-radius:50%; background:var(--muted); margin-right:6px; vertical-align:middle; }
   .dot.ok { background:var(--ok); } .dot.warn { background:var(--warn); } .dot.bad { background:var(--bad); }
+  .labmode #pad { display:none; }
   #pad { display:block; margin:6px auto; touch-action:none; user-select:none; -webkit-user-select:none; max-width:100%; }
   .bars { display:grid; grid-template-columns:auto 1fr 3.5em; gap:6px 10px; align-items:center; font-variant-numeric:tabular-nums; }
   .bar { height:12px; background:var(--line); border-radius:6px; position:relative; overflow:hidden; }
@@ -47,6 +48,7 @@
   .labbtn { display:grid; grid-template-columns:repeat(4, 1fr); gap:8px; margin:10px 0; }
   .labbtn button { font-size:1.05rem; padding:12px 4px; }
   #labplot { width:100%; height:260px; display:block; }
+  #pidplot { width:100%; height:300px; display:block; margin-top:6px; }
   .labset { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; }
   .labset input { width:6em; font:inherit; padding:4px 8px; border-radius:6px; border:1px solid var(--line); background:var(--bg); color:var(--fg); }
   .locked .labbtn, .locked .labset { opacity:.45; pointer-events:none; }
@@ -56,7 +58,7 @@
 </head>
 <body>
 <h1 id="title">BesBot</h1>
-<p class="sub">Drive with the pad (touch or mouse) or the keyboard: arrow keys or W A S D, space to stop. The robot stops by itself when the commands stop coming.</p>
+<p class="sub">Drive with the pad (touch or mouse), the keyboard (arrow keys or W A S D, space to stop) or a gamepad (left stick; B stops; Y switches the drive mode; in lab mode the D-pad does the steps). The robot stops by itself when the commands stop coming.</p>
 
 <div class="card">
   <div class="ctl">
@@ -78,12 +80,14 @@
     <button class="stop" id="stop">STOP</button>
   </div>
   <canvas id="pad" width="300" height="300"></canvas>
+  <p class="muted" id="padoff" hidden style="margin:10px 0">The pad is off in <b>Lab position control</b>: drive with the buttons below, or choose Power or Speed under &ldquo;Drive mode&rdquo; to use the pad again. STOP always works.</p>
   <div class="bars">
     <span>Left</span><div class="bar"><b id="lb"></b></div><span id="lv">0 %</span>
     <span>Right</span><div class="bar"><b id="rb"></b></div><span id="rv">0 %</span>
   </div>
   <p class="muted" id="speeds" style="margin:8px 0 0"></p>
   <p class="muted" id="wifi" style="margin:4px 0 0"></p>
+  <p class="muted" id="gp" style="margin:4px 0 0">Gamepad: none seen yet (press a button on it).</p>
 </div>
 
 <div class="card" id="labcard" hidden>
@@ -92,20 +96,31 @@
     <button id="labl" type="button">&#8634; 90&deg;</button><button id="labf" type="button">&#8593; 0.5 m</button>
     <button id="labb" type="button">&#8595; 0.5 m</button><button id="labr" type="button">&#8635; 90&deg;</button>
   </div>
+  <div class="labset" style="margin-bottom:8px">
+    <label>Step <input id="lab_step" type="number" min="10" max="2000" step="10"> mm</label>
+    <label>Turn <input id="lab_turn" type="number" min="1" max="360" step="5"> &deg;</label>
+  </div>
   <div class="labset">
     <label>Kp <input id="lab_kp" type="number" min="0.5" max="10000" step="0.5"> 1/s&sup2;</label>
     <span class="muted" id="labfn"></span>
-    <label>&zeta; <input id="lab_zeta" type="number" min="0" max="5" step="0.05"></label>
+    <label>&zeta; <input id="lab_zeta" type="number" min="0" max="10" step="0.05"></label>
     <span class="muted" id="labzn"></span>
   </div>
   <div class="labset" style="margin-top:8px" id="zetas">
     <button type="button" data-z="0">&zeta; = 0</button><button type="button" data-z="0.2">&zeta; = 0.2</button>
     <button type="button" data-z="0.7">&zeta; = 0.7</button><button type="button" data-z="1">&zeta; = 1</button>
-    <button type="button" data-z="3">&zeta; = 3</button>
+    <button type="button" data-z="3">&zeta; = 3</button><button type="button" data-z="10">&zeta; = 10</button>
   </div>
   <canvas id="labplot"></canvas>
   <p class="muted" id="labmsg" style="margin:6px 0 0"></p>
-  <p class="muted" style="margin:6px 0 0">Each wheel follows a mass-spring-damper towards its target: acceleration = Kp &middot; (target &minus; position) &minus; 2&zeta;&radic;Kp &middot; speed. Natural frequency &radic;Kp/2&pi; (Kp 39.5: 1 Hz). &zeta; = 0 undamped (it keeps swinging), below 1 underdamped (overshoot), 1 critically damped, above 1 overdamped (slow). Clicks add up; STOP stops it. The robot can't go faster than about 0.6 m/s or accelerate faster than 2 m/s&sup2;: where the model asks for more it is held to that (&ldquo;limited&rdquo;), so big steps overshoot less than the linear theory says.</p>
+  <p class="warn" id="labreply" style="margin:4px 0 0" hidden></p>
+  <div class="row" style="margin-top:12px;gap:10px;align-items:center">
+    <b style="font-size:.95rem">Controller terms</b>
+    <span class="seg" id="pidwheel"><button type="button" data-w="0" class="on">Left wheel</button><button type="button" data-w="1">Right wheel</button></span>
+  </div>
+  <canvas id="pidplot"></canvas>
+  <p class="muted" style="margin:6px 0 0">Top: the model&rsquo;s acceleration, P = Kp &middot; (target &minus; position) (the spring) plus D = &minus;2&zeta;&radic;Kp &middot; speed (the damper); there is no I term. The sum is held to &plusmn;2 m/s&sup2; (grey lines). Bottom: the motor power that makes the wheel follow the model: feed-forward (from the calibration: dead zone + speed + acceleration), P on the speed error, I on the position error (the integral of the speed error), and their sum, at most &plusmn;100 %.</p>
+  <p class="muted" style="margin:6px 0 0">Each wheel follows a mass-spring-damper towards its target: acceleration = Kp &middot; (target &minus; position) &minus; 2&zeta;&radic;Kp &middot; speed. Natural frequency &radic;Kp/2&pi; (Kp 39.5: 1 Hz). &zeta; = 0 undamped (it keeps swinging), below 1 underdamped (overshoot), 1 critically damped, above 1 overdamped (slow). Clicks add up; STOP stops it. The robot can't go faster than about 0.6 m/s or accelerate faster than 2 m/s&sup2;: where the model asks for more it is held to that (&ldquo;limited&rdquo;) and stops being linear. Undamped swings then stay smaller than the step, but a high Kp brakes too late: with Kp above about 250 a 0.5 m step overshoots even at &zeta; = 1. Smaller steps keep it linear longer.</p>
 </div>
 
 <div class="card" id="setcard">
@@ -141,10 +156,11 @@
       <p class="muted" style="margin:6px 0 0">The calibration takes about 35 s. The robot spins in place, both ways, up to full speed: put it on the floor with half a metre free around it (or lift it, but the floor gives values that fit driving better). STOP ends it.</p>
       <table class="p" id="caltab"></table>
       <div class="gains">
-        <label>kp <input id="kp" type="number" step="0.01" min="0"> % per 100 mm/s</label>
-        <label>ki <input id="ki" type="number" step="0.01" min="0"> % per mm</label>
+        <label>Speed loop P <input id="kp" type="number" step="0.01" min="0"> % per 100 mm/s</label>
+        <label>Speed loop I <input id="ki" type="number" step="0.01" min="0"> % per mm</label>
         <button id="usemin" type="button">Use the dead zone as minimum power</button>
       </div>
+      <p class="muted" style="margin:6px 0 0">The speed loop keeps each wheel at the speed it is asked for (in Speed mode, and in Lab mode where the model asks): on top of the feed-forward from the table it adds P (extra power per speed error) and I (extra power per mm the wheel has fallen behind). The calibration sets both, for a response in about 0.12 s without overshoot. Not the same as the lab model's Kp, which sets the spring.</p>
       <p class="muted" id="enc" style="margin:8px 0 0"></p>
     </div>
   </details>
@@ -177,7 +193,7 @@ async function fwState(post) {
 }
 $("fwcheck").onclick = () => fwState(true);
 fwState(false); setInterval(() => fwState(false), 2000);
-let ws = null, state = {}, ctl = { token: "", msg: "" }, cmd = { x: 0, y: 0 }, src = "touch", lastSent = 0, padActive = false, keys = new Set();
+let ws = null, state = {}, ctl = { token: "", msg: "" }, cmd = { x: 0, y: 0 }, src = "touch", lastSent = 0, padActive = false, gpActive = false, keys = new Set();
 
 function wsUrl() {
   let u = new URL("ws", location.href);
@@ -207,7 +223,7 @@ function connect() {
     if (j.busy) { $("driver").textContent = "Someone else is driving: wait until they stop."; return; }
     if (j.need) { ctl.msg = "You don't have control (any more): ask for it again."; showCtl(); return; }
     if (j.access && !j.drive) { onAccess(j); return; }
-    if (j.lab && !j.drive) { $("labmsg").textContent = { mode: "Choose Lab position control first.", cal: "Wait for the calibration to end.", buttons: "In lab mode the buttons move the robot." }[j.lab] || $("labmsg").textContent; return; }
+    if (j.lab && !j.drive) { labReply({ mode: "Choose Lab position control first.", cal: "Wait for the calibration to end.", buttons: "In lab mode the step buttons (or the arrow keys, or a gamepad's D-pad) move the robot." }[j.lab] || ""); return; }
     if (j.cal && !j.drive) { $("calmsg").textContent = { moving: "Stop the robot first.", running: "Already calibrating." }[j.cal] || ""; calPoll(true); return; }
     if (j.drive) { state = j; showDrive(); showCtl(); }
     else if (j.wifi) showWifi(j);
@@ -251,7 +267,7 @@ function showDrive() {
   const s = state;
   if (s.host && s.host !== "besbot") { $("title").textContent = "BesBot (" + s.host + ")"; document.title = $("title").textContent; }
   for (const [k, v] of [["l", s.l], ["r", s.r]]) {
-    const b = $(k + "b"), p = Math.round(v * 100);
+    const b = $(k + "b"), p = (v * 100).toFixed(1);
     b.style.left = (v >= 0 ? 50 : 50 + v * 50) + "%"; b.style.width = Math.abs(v) * 50 + "%";
     $(k + "v").textContent = p + " %";
   }
@@ -263,10 +279,11 @@ function showDrive() {
     $("mpower").classList.toggle("on", s.mode === "power" || !!s.fault); $("mspeed").classList.toggle("on", s.mode === "speed" && !s.fault);
     $("mlab").classList.toggle("on", s.mode === "lab" && !s.fault);
     $("labcard").hidden = s.mode !== "lab" || !!s.fault;
+    document.body.classList.toggle("labmode", s.mode === "lab" && !s.fault); $("padoff").hidden = s.mode !== "lab" || !!s.fault;
     if (s.lab) showLab(s);
     $("speeds").textContent = `Wheel speeds: left ${s.vl} mm/s, right ${s.vr} mm/s` + (s.mode === "speed" ? ` (full command: ${s.top} mm/s)` : "");
     $("modenote").innerHTML = s.fault ? `<span class="warn">Speed mode stopped: the ${s.fault} wheel didn't follow (stalled, or its encoder isn't counting). It drives in power mode until you choose Speed again.</span>` :
-      s.mode === "lab" ? (s.calibrated ? "The buttons below move the robot 0.5 m or turn it 90° with a second-order response; the pad and other controllers don't drive it in this mode." :
+      s.mode === "lab" ? (s.calibrated ? "The buttons below (or a gamepad's D-pad) move the robot a step or turn it (sizes below) with a second-order response; the pad and the stick don't drive it in this mode. For a clean comparison of ζ, keep Kp below about 250: above that the robot's acceleration limit makes even ζ = 1 overshoot." :
         '<span class="warn">Not calibrated yet: lab mode uses rough guesses for the wheels. Calibrate first.</span>') :
       s.mode === "speed" ? (s.calibrated ? "A command sets each wheel's speed; the encoders hold it (straight lines, slow driving, the same on any floor)." :
         '<span class="warn">Not calibrated yet: speed mode uses rough guesses. Calibrate first.</span>') :
@@ -289,32 +306,80 @@ $("mlab").onclick = () => send({ set: { mode: "lab" } });
 
 // Lab position control: the buttons, Kp and zeta, and a plot of the last 15 s (distance and heading, target dashed).
 for (const [id, what] of [["labl", "left"], ["labf", "fwd"], ["labb", "back"], ["labr", "right"]]) $(id).onclick = () => send({ lab: what });
-for (const k of ["lab_kp", "lab_zeta"]) $(k).onchange = () => { const v = +$(k).value; if ($(k).value !== "" && v >= 0) send({ set: { [k]: v } }); };
+for (const k of ["lab_kp", "lab_zeta", "lab_step", "lab_turn"]) $(k).onchange = () => { const v = +$(k).value; if ($(k).value !== "" && v >= 0) send({ set: { [k]: v } }); };
 for (const b of $("zetas").children) b.onclick = () => send({ set: { lab_zeta: +b.dataset.z } });
-const labHist = [];
+const labHist = [], pidHist = [];
+let pidWheel = 0, labReplyTimer = null;
+function labReply(t) {         // a short answer to a click (shown 4 s, apart from the state line above it)
+  $("labreply").textContent = t; $("labreply").hidden = !t;
+  clearTimeout(labReplyTimer); if (t) labReplyTimer = setTimeout(() => { $("labreply").hidden = true; }, 4000);
+}
+for (const b of $("pidwheel").children) b.onclick = () => {
+  pidWheel = +b.dataset.w; for (const c of $("pidwheel").children) c.classList.toggle("on", c === b); drawPid(performance.now() / 1000);
+};
 function zetaName(z) { return z === 0 ? "undamped" : z < 1 ? "underdamped" : z === 1 ? "critically damped" : "overdamped"; }
 function showLab(s) {
-  for (const k of ["lab_kp", "lab_zeta"]) if (document.activeElement !== $(k)) $(k).value = s[k];
+  for (const k of ["lab_kp", "lab_zeta", "lab_step", "lab_turn"]) if (s[k] != null && document.activeElement !== $(k)) $(k).value = s[k];
+  if (s.lab_step != null) {
+    const d = `${+(s.lab_step / 1000).toFixed(3)} m`, a = `${s.lab_turn}&deg;`;
+    $("labl").innerHTML = `&#8634; ${a}`; $("labr").innerHTML = `&#8635; ${a}`; $("labf").innerHTML = `&#8593; ${d}`; $("labb").innerHTML = `&#8595; ${d}`;
+  }
   $("labfn").textContent = `natural frequency ${(Math.sqrt(s.lab_kp) / 2 / Math.PI).toFixed(2)} Hz`;
   $("labzn").textContent = zetaName(s.lab_zeta);
   for (const b of $("zetas").children) b.classList.toggle("on", Math.abs(+b.dataset.z - s.lab_zeta) < 0.001);
   const L = s.lab, now = performance.now() / 1000;
-  labHist.push([now, L.s, L.st, L.h, L.ht]);
+  labHist.push([now, L.s, L.st, L.h, L.ht, L.m ?? L.s, L.mh ?? L.h]);
   while (labHist.length && labHist[0][0] < now - 15) labHist.shift();
+  if (s.pid) { pidHist.push([now, s.pid]); while (pidHist.length && pidHist[0][0] < now - 15) pidHist.shift(); }
   $("labmsg").textContent = (L.on ? "Moving" : "At rest") + ` · distance ${L.s} mm (target ${L.st}) · heading ${L.h}° (target ${L.ht}°)` +
     (L.lim ? " · limited by the robot's speed or acceleration" : "");
-  drawLab(now);
+  drawLab(now); drawPid(now);
+}
+// The controller's terms over the last 15 s for one wheel: the model's P and D (and their sum, held to +-2 m/s^2), then
+// the motor's feed-forward, P, I and total power.
+function drawPid(now) {
+  const c = $("pidplot"), r = c.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+  if (!r.width) return;
+  c.width = r.width * dpr; c.height = r.height * dpr;
+  const g = c.getContext("2d"), cs = getComputedStyle(document.documentElement), W = r.width, H = r.height, col = (k) => cs.getPropertyValue(k);
+  g.scale(dpr, dpr); g.font = "11px system-ui";
+  const w = pidWheel, lim = (v, a) => Math.max(-a, Math.min(a, v));
+  const panels = [
+    ["model acceleration (m/s²)", [["P", (p) => p[0], "--accent", []], ["D", (p) => p[1], "--warn", []], ["sum", (p) => lim(p[0] + p[1], 2), "--fg", []]], 2],
+    ["motor power (%)", [["FF", (p) => p[2], "--muted", [4, 3]], ["P", (p) => p[3], "--accent", []], ["I", (p) => p[4], "--ok", []], ["total", (p) => p[5], "--fg", []]], 100],
+  ], ph = (H - 6) / 2;
+  panels.forEach(([name, lines, bound], k) => {
+    const top = 4 + k * (ph + 2), bot = top + ph - 16, left = 44, right = W - 6;
+    let lo = -bound * 0.05, hi = bound * 0.05;
+    for (const [, p] of pidHist) for (const [, f] of lines) { const v = f(p[w]); lo = Math.min(lo, v); hi = Math.max(hi, v); }
+    const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
+    const X = (t) => left + (t - (now - 15)) / 15 * (right - left), Y = (v) => bot - (v - lo) / (hi - lo) * (bot - top);
+    g.lineWidth = 1; g.setLineDash([]); g.strokeStyle = col("--line"); g.strokeRect(left, top, right - left, bot - top);
+    g.beginPath(); g.moveTo(left, Y(0)); g.lineTo(right, Y(0)); g.stroke();
+    if (k === 0) for (const b of [bound, -bound]) if (b > lo && b < hi) { g.setLineDash([2, 3]); g.strokeStyle = col("--muted"); g.beginPath(); g.moveTo(left, Y(b)); g.lineTo(right, Y(b)); g.stroke(); }
+    g.setLineDash([]); g.fillStyle = col("--muted");
+    const fmt = (v) => Math.abs(hi - lo) < 10 ? v.toFixed(1) : Math.round(v);
+    g.fillText(fmt(hi - pad), 2, top + 10); g.fillText(fmt(lo + pad), 2, bot);
+    g.fillText(name, left + 4, top + 12);
+    let lx = left + 4 + g.measureText(name).width + 10;
+    for (const [label, f, colour, dash] of lines) {
+      g.setLineDash(dash); g.lineWidth = label === "sum" || label === "total" ? 2 : 1.5; g.strokeStyle = col(colour); g.beginPath();
+      pidHist.forEach(([t, p], i) => i ? g.lineTo(X(t), Y(f(p[w]))) : g.moveTo(X(t), Y(f(p[w])))); g.stroke();
+      g.setLineDash([]); g.fillStyle = col(colour); g.fillText(label, lx, top + 12); lx += g.measureText(label).width + 8;
+    }
+  });
+  g.fillStyle = col("--muted"); g.fillText("15 s", W - 30, H - 2);
 }
 function drawLab(now) {
   const c = $("labplot"), r = c.getBoundingClientRect(), dpr = devicePixelRatio || 1;
   c.width = r.width * dpr; c.height = r.height * dpr;
   const g = c.getContext("2d"), cs = getComputedStyle(document.documentElement), W = r.width, H = r.height;
   g.scale(dpr, dpr); g.font = "11px system-ui"; g.lineWidth = 1.5;
-  const panels = [["distance (mm)", 1, 2, "--accent"], ["heading (°)", 3, 4, "--ok"]], ph = (H - 10) / 2;
-  panels.forEach(([name, ia, it, col], p) => {
+  const panels = [["distance (mm)", 1, 2, "--accent", 5], ["heading (°)", 3, 4, "--ok", 6]], ph = (H - 10) / 2;
+  panels.forEach(([name, ia, it, col, im], p) => {
     const top = 4 + p * (ph + 2), bot = top + ph - 14, left = 44, right = W - 6;
     let lo = Infinity, hi = -Infinity;
-    for (const h of labHist) { lo = Math.min(lo, h[ia], h[it]); hi = Math.max(hi, h[ia], h[it]); }
+    for (const h of labHist) { lo = Math.min(lo, h[ia], h[it], h[im]); hi = Math.max(hi, h[ia], h[it], h[im]); }
     if (!isFinite(lo)) lo = 0, hi = 1;
     if (hi - lo < (p ? 10 : 50)) { const m = (hi + lo) / 2, d = p ? 5 : 25; lo = m - d; hi = m + d; }
     const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
@@ -322,13 +387,13 @@ function drawLab(now) {
     g.strokeStyle = cs.getPropertyValue("--line"); g.strokeRect(left, top, right - left, bot - top);
     g.fillStyle = cs.getPropertyValue("--muted");
     g.fillText(name, left + 4, top + 12); g.fillText(Math.round(hi - pad), 2, top + 10); g.fillText(Math.round(lo + pad), 2, bot);
-    for (const [i, dash, colour] of [[it, [5, 4], "--muted"], [ia, [], col]]) {
-      g.setLineDash(dash); g.strokeStyle = cs.getPropertyValue(colour); g.beginPath();
+    for (const [i, dash, colour, w] of [[it, [5, 4], "--muted", 1.5], [im, [2, 3], col, 1], [ia, [], col, 1.5]]) {
+      g.setLineDash(dash); g.lineWidth = w; g.strokeStyle = cs.getPropertyValue(colour); g.beginPath();
       labHist.forEach((h, k) => k ? g.lineTo(X(h[0]), Y(h[i])) : g.moveTo(X(h[0]), Y(h[i]))); g.stroke();
     }
     g.setLineDash([]);
   });
-  g.fillStyle = cs.getPropertyValue("--muted"); g.fillText("last 15 s", W - 56, H - 2);
+  g.fillStyle = cs.getPropertyValue("--muted"); g.fillText("15 s · dashed target · dotted model · solid robot", 44, H - 2);
 }
 $("calgo").onclick = () => send({ calibrate: 1 });
 $("calstop").onclick = () => send({ calibrate: 0 });
@@ -377,7 +442,7 @@ function drawPad() {
   ctx.lineWidth = 2; ctx.strokeStyle = cs.getPropertyValue("--line"); ctx.stroke();
   ctx.beginPath(); ctx.moveTo(w / 2, 20); ctx.lineTo(w / 2, w - 20); ctx.moveTo(20, w / 2); ctx.lineTo(w - 20, w / 2); ctx.stroke();
   ctx.beginPath(); ctx.arc(w / 2 + cmd.x * r, w / 2 - cmd.y * r, 26, 0, 7);
-  ctx.fillStyle = padActive || keys.size ? cs.getPropertyValue("--accent") : cs.getPropertyValue("--muted"); ctx.fill();
+  ctx.fillStyle = padActive || keys.size || gpActive ? cs.getPropertyValue("--accent") : cs.getPropertyValue("--muted"); ctx.fill();
 }
 function padAt(e) {
   const b = pad.getBoundingClientRect(), r = b.width / 2 - 10 * b.width / pad.width;
@@ -395,9 +460,13 @@ addEventListener("keydown", (e) => {
   if (e.target.tagName === "INPUT") return;
   if (e.code === "Space") { keys.clear(); cmd = { x: 0, y: 0 }; send({ stop: 1 }); drawPad(); e.preventDefault(); return; }
   const k = KEYMAP[e.code]; if (!k) return;
+  if (state.mode === "lab" && !state.fault) {          // lab mode: a key is a step button (once per press)
+    if (!e.repeat) send({ lab: { f: "fwd", b: "back", l: "left", r: "right" }[k] });
+    e.preventDefault(); return;
+  }
   keys.add(k); fromKeys(); e.preventDefault();
 });
-addEventListener("keyup", (e) => { const k = KEYMAP[e.code]; if (!k) return; keys.delete(k); fromKeys(); if (!keys.size) send({ stop: 1 }); });
+addEventListener("keyup", (e) => { const k = KEYMAP[e.code]; if (!k || !keys.has(k)) return; keys.delete(k); fromKeys(); if (!keys.size) send({ stop: 1 }); });
 addEventListener("blur", () => { if (keys.size || padActive) { keys.clear(); padActive = false; cmd = { x: 0, y: 0 }; send({ stop: 1 }); drawPad(); } });
 function fromKeys() {
   const y = (keys.has("f") ? 1 : 0) - (keys.has("b") ? 1 : 0), x = (keys.has("r") ? 1 : 0) - (keys.has("l") ? 1 : 0);
@@ -405,9 +474,45 @@ function fromKeys() {
 }
 $("stop").onclick = () => { keys.clear(); padActive = false; cmd = { x: 0, y: 0 }; send({ stop: 1 }); drawPad(); };
 
-// While the pad or a key is held: a command every 80 ms (the robot stops 0.5 s after the last one).
+// A gamepad (standard mapping): the left stick drives (the D-pad too); B stops. In lab mode the D-pad clicks the step
+// buttons (up/down a step, left/right a turn) and the stick does nothing (the robot ignores drive commands then).
+let gpPrev = [], gpName = "";
+function gamepad() {
+  let g = null;
+  for (const c of navigator.getGamepads ? navigator.getGamepads() : []) if (c && c.connected) { g = c; break; }
+  const name = g ? g.id.replace(/\s*\(.*$/, "") || "gamepad" : "";
+  if (name !== gpName) { gpName = name; $("gp").textContent = g ? `Gamepad: ${name}. Left stick drives, B stops, Y switches the mode (Power, Speed, Lab); in lab mode the D-pad does the steps.` : "Gamepad: none seen yet (press a button on it)."; }
+  if (!g) { if (gpActive) { gpActive = false; cmd = { x: 0, y: 0 }; send({ stop: 1 }); drawPad(); } return; }
+  const b = (i) => !!(g.buttons[i] && g.buttons[i].pressed), edge = (i) => b(i) && !gpPrev[i];
+  const lab = state.mode === "lab" && !state.fault;
+  if (edge(1)) { $("stop").onclick(); gpActive = false; }
+  else if (edge(3)) {          // Y: the next drive mode (stops first)
+    const order = ["power", "speed", "lab"], cur = state.fault ? "power" : state.mode || "power";
+    if (gpActive) { gpActive = false; cmd = { x: 0, y: 0 }; send({ stop: 1 }); drawPad(); }
+    send({ set: { mode: order[(order.indexOf(cur) + 1) % 3] } });
+  }
+  else if (lab) {
+    for (const [i, what] of [[12, "fwd"], [13, "back"], [14, "left"], [15, "right"]]) if (edge(i)) send({ lab: what });
+  } else if (!padActive && !keys.size) {
+    // A small dead zone (sticks rest a few % off centre), then a squared curve: fine control near the centre.
+    const dz = (v) => Math.abs(v) < 0.06 ? 0 : (v - Math.sign(v) * 0.06) / 0.94;
+    let x = dz(g.axes[0] || 0), y = -dz(g.axes[1] || 0);
+    { const m = Math.hypot(x, y); if (m > 0) { const k = Math.min(m, 1); x *= k; y *= k; } }
+    const dy = (b(12) ? 1 : 0) - (b(13) ? 1 : 0), dx = (b(15) ? 1 : 0) - (b(14) ? 1 : 0);
+    if (!x && !y && (dx || dy)) x = dy ? dx * 0.5 : dx * 0.7, y = dy;
+    const m = Math.hypot(x, y); if (m > 1) x /= m, y /= m;
+    if (x || y) { gpActive = true; cmd = { x, y }; src = "gamepad"; drawPad(); }
+    else if (gpActive) { gpActive = false; cmd = { x: 0, y: 0 }; send({ stop: 1 }); drawPad(); }
+  }
+  gpPrev = g.buttons.map((x) => x.pressed);
+}
+addEventListener("gamepadconnected", () => gamepad());
+addEventListener("gamepaddisconnected", () => gamepad());
+
+// While the pad, a key or the gamepad is held: a command every 80 ms (the robot stops 0.5 s after the last one).
 setInterval(() => {
-  if ((padActive || keys.size) && Date.now() - lastSent >= 75) { send({ x: +cmd.x.toFixed(3), y: +cmd.y.toFixed(3), src }); lastSent = Date.now(); }
+  gamepad();
+  if ((padActive || keys.size || gpActive) && Date.now() - lastSent >= 75) { send({ x: +cmd.x.toFixed(3), y: +cmd.y.toFixed(3), src }); lastSent = Date.now(); }
 }, 40);
 // A hidden tab lets go of its connection (the robot and the lab demos site take only a few): back when shown again.
 document.addEventListener("visibilitychange", () => {

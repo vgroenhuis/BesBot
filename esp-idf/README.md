@@ -22,19 +22,26 @@ ESP-IDF 6.1 firmware for the BesBot (ESP32-C5-DevKitC-1 + L298N), replacing the 
   the wheel's), then a check at half speed. Kept in NVS (`besbot/wheels`); kp/ki can be changed
   (`{"set":{"kp":..,"ki":..}}`, duty per mm/s and per mm). `GET /api/wheels`: counts, speeds, odometry, parameters and
   the last calibration's measurements. The drive state adds `"mode","fault","cal","calibrated","vl","vr","top"`.
-* **Lab position control** (since 1.8.0; mode `"lab"`): `{"lab":"fwd"|"back"|"left"|"right"}` moves the robot 0.5 m
-  or turns it 90 degrees (clicks add up). Each wheel follows a virtual mass-spring-damper, a = Kp (target - x) -
-  2 zeta sqrt(Kp) v (`{"set":{"lab_kp":39.5,"lab_zeta":0.7}}`, NVS `besbot/lab`; Kp 0.5..10000 1/s^2, 39.5 = 1 Hz undamped; stiff settings run the model in up to 50 sub-steps),
-  tracked by the speed control; the model's speed is held to the top speed and its acceleration to 2 m/s^2 ("lim").
-  Drive commands don't move it in this mode; STOP, a change of control or 60 s without a click stop it. The state's
-  `"lab":{"on","lim","s","st","h","ht"}` (distance/heading and targets) feeds the robot page's plot.
+* **Lab position control** (since 1.8.0; mode `"lab"`): `{"lab":"fwd"|"back"|"left"|"right"}` moves the robot a step
+  (default 0.5 m) or turns it (default 90 degrees; clicks add up). Each wheel follows a virtual mass-spring-damper,
+  a = Kp (target - x) - 2 zeta sqrt(Kp) v (`{"set":{"lab_kp":39.5,"lab_zeta":0.7,"lab_step":500,"lab_turn":90}}`, NVS
+  `besbot/lab`; Kp 0.5..10000 1/s^2, 39.5 = 1 Hz undamped; zeta 0..10; step 10..2000 mm; turn 1..360 degrees; stiff
+  settings run the model in up to 100 sub-steps), tracked by the speed control; the model's speed is held to the top
+  speed and its acceleration to 2 m/s^2 ("lim"). With such a limit a high Kp brakes too late: above Kp ~250 a 0.5 m
+  step overshoots even at zeta 1. Drive commands don't move it in this mode (the page's arrow keys and a gamepad's
+  D-pad click the steps); STOP, a change of control or 60 s without a click stop it. The state's
+  `"lab":{"on","lim","s","st","m","h","ht","mh"}` (distance/heading: robot, target, model) and `"pid"` (per wheel: the
+  model's P and D in m/s^2, the motor's feed-forward, P, I and total in %) feed the robot page's plots.
+* **Robot page gamepad** (since 1.8.4): left stick drives (small dead zone, squared response), B stops, Y switches the
+  drive mode, D-pad = lab steps. The LED shows the drive mode while driving (since 1.8.8): power green-cyan, speed
+  blue, lab magenta.
 * **Control** (since 1.3.0): one person at a time controls the robot, everyone else watches (`closer_access` in the
   closer_demo component, `components/closer_demo/include/closer_access.h`). Control comes with a code the robot
   shows on request (`{"access":"request"}`, valid 60 s; BesBot: 2 digits, 2 tries a code; on the display and in
   the serial log), with the lab demos site's grant (an admin:
   "Take control"; a server link takes it only while nobody has it), or with the fixed Bluetooth code. A new holder takes
-  over; control ends on release, 60 s after the holder's connection closed (unless it comes back with its token), or
-  after 10 minutes without a command. Driving and settings need control (`{"need":1}` otherwise; HTTP: `?token=` or
+  over; control ends on release, 10 minutes after the holder's connection closed (unless it comes back with its token), or
+  after 30 minutes without a command, setting or calibration (since 1.8.11; 60 s and 10 minutes before). Driving and settings need control (`{"need":1}` otherwise; HTTP: `?token=` or
   `X-Access-Token`); stop works for everyone; the fixed Bluetooth code can only be changed with the site's grant.
   The state carries `"access":"you"|"other"|"none"` and `"code"` (seconds the code is still shown).
 * **Display** (since 1.4.0; this layout since 1.5.0): a 128x64 I2C OLED, SSD1306 (or SH1106:

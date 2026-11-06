@@ -39,6 +39,7 @@ float wheels_top_speed(void);                            // mm/s for a full comm
 // encoder doesn't follow (stalled, or no pulses): then stop.
 void wheels_ctl_reset(void);
 int wheels_control(const float v[2], const float a[2], float dt, float duty[2]);
+void wheels_ctl_terms(int side, float t[4]);              // the last duty (-1..1): feed-forward, P (speed), I (position), total
 
 // Calibration (about 40 s): the robot spins in place, both ways.
 bool wheels_cal_start(void);

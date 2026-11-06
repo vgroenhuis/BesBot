@@ -119,8 +119,8 @@ enum { MODE_POWER, MODE_SPEED, MODE_LAB };
 static const char *MODE_NAMES[] = {"power", "speed", "lab"};
 static uint8_t drive_mode = MODE_POWER;    // NVS besbot/mode
 static int enc_fault = -1;                 // speed/lab mode stopped on this wheel (stalled, or its encoder): power until chosen again
-typedef struct { float kp, zeta; } lab_cfg_t;
-static lab_cfg_t lab_cfg = {39.48f, 0.7f};   // NVS besbot/lab; Kp = (2 pi 1 Hz)^2: undamped, it swings at 1 Hz
+typedef struct { float kp, zeta, step_mm, turn_deg; } lab_cfg_t;    // (step and turn since 1.8.7; older blobs: 2 floats)
+static lab_cfg_t lab_cfg = {39.48f, 0.7f, 500, 90};   // NVS besbot/lab; Kp = (2 pi 1 Hz)^2: undamped, it swings at 1 Hz
 static settings_t cfg = {.max_pct = CONFIG_BESBOT_MAX_PCT, .accel_pct = 25, .trim = 0, .min_pct = 10};
 
 static portMUX_TYPE drive_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -151,9 +151,9 @@ static void settings_load(void) {
         len = sizeof ble_code;
         if (nvs_get_str(h, "ble_code", ble_code, &len) != ESP_OK) ble_code[0] = 0;
         if (nvs_get_u8(h, "mode", &drive_mode) != ESP_OK || drive_mode > MODE_LAB) drive_mode = MODE_POWER;
-        lab_cfg_t lc;
+        lab_cfg_t lc = lab_cfg;
         len = sizeof lc;
-        if (nvs_get_blob(h, "lab", &lc, &len) == ESP_OK && len == sizeof lc) lab_cfg = lc;
+        if (nvs_get_blob(h, "lab", &lc, &len) == ESP_OK && len >= 2 * sizeof(float) && len % sizeof(float) == 0) lab_cfg = lc;
         nvs_close(h);
     }
     // Once each: a saved old default becomes the new one (top speed 70 -> 100 % in 1.5.1, minimum power 30 -> 10 %
@@ -296,14 +296,15 @@ static bool driving_recently(void) { return esp_timer_get_time() - D.moving_us <
 // asks (an undamped 0.5 m step at 1 Hz would need 3 m/s): the model's speed is held to the robot's top speed and its
 // acceleration to LAB_ACCEL ("lim" in the state). STOP, a change of control, or LAB_IDLE_S without a click stop it.
 
-#define LAB_STEP_MM 500.0f
-#define LAB_TURN_MM ((float)M_PI / 2 * WHEEL_BASE_MM / 2)      // a wheel's travel for 90 degrees on the spot
+#define LAB_STEP_MM lab_cfg.step_mm
+#define LAB_TURN_MM (lab_cfg.turn_deg * (float)M_PI / 180 * WHEEL_BASE_MM / 2)   // a wheel's travel for the turn on the spot
 #define LAB_ACCEL 2000.0f                                     // mm/s^2
 #define LAB_IDLE_S 60
 
 static struct {
     bool active, limited;
     float tgt[2], x[2], v[2];          // per wheel (mm, mm/s): target, the model's position and speed
+    float ap[2], ad[2];                // the model's acceleration (mm/s^2) from the spring (P) and the damper (D), before limits
     float origin[2];                   // the wheels' positions when lab mode began (for the state's distance/heading)
     int64_t click_us;
 } L;
@@ -369,13 +370,14 @@ static bool lab_step(float dt, float v_out[2], float a_out[2]) {
         // A stiff model (high Kp or damping) needs smaller steps than the control tick to stay stable: sub-steps
         // with (sqrt(Kp) + kd) * h <= 0.2.
         int n = (int)ceilf((sqrtf(kp) + kd) * dt / 0.2f);
-        n = n < 1 ? 1 : n > 50 ? 50 : n;
+        n = n < 1 ? 1 : n > 100 ? 100 : n;
         float h = dt / n;
         bool still = true;
         for (int s = 0; s < 2; s++) {
             float v0 = L.v[s];
             for (int k = 0; k < n; k++) {
-                float a = kp * (L.tgt[s] - L.x[s]) - kd * L.v[s];
+                L.ap[s] = kp * (L.tgt[s] - L.x[s]), L.ad[s] = -kd * L.v[s];
+                float a = L.ap[s] + L.ad[s];
                 if (fabsf(a) > LAB_ACCEL) a = copysignf(LAB_ACCEL, a), L.limited = true;
                 float v = L.v[s] + a * h;
                 if (fabsf(v) > top) v = copysignf(top, v), L.limited = true;
@@ -387,7 +389,7 @@ static bool lab_step(float dt, float v_out[2], float a_out[2]) {
             still &= fabsf(L.tgt[s] - L.x[s]) < 0.5f && fabsf(L.v[s]) < 2;
         }
         if (still) {           // settled: exactly on target, and let go
-            for (int s = 0; s < 2; s++) L.x[s] = L.tgt[s], L.v[s] = v_out[s] = a_out[s] = 0;
+            for (int s = 0; s < 2; s++) L.x[s] = L.tgt[s], L.v[s] = v_out[s] = a_out[s] = L.ap[s] = L.ad[s] = 0;
             L.active = active = false;
         }
     }
@@ -401,6 +403,7 @@ static bool lab_step(float dt, float v_out[2], float a_out[2]) {
 static const char *calibrate(int who, bool start) {
     if (!start) { wheels_cal_abort("asked to"); return "{\"cal\":\"stopped\"}"; }
     if (!closer_access_has(who)) return "{\"need\":1}";
+    closer_access_used(who);
     portENTER_CRITICAL(&drive_mux);
     bool still = D.out[0] == 0 && D.out[1] == 0 && D.target[0] == 0 && D.target[1] == 0;
     portEXIT_CRITICAL(&drive_mux);
@@ -503,7 +506,7 @@ static void display_drive(float *left, float *right, bool *bluetooth) {
 // "vl","vr" (measured, mm/s),"top" (mm/s for a full command in speed mode),"lab_kp","lab_zeta","lab":{"on" (moving),
 // "lim" (the model was held to the robot's limits),"s","st" (distance and its target, mm),"h","ht" (heading and its
 // target, degrees, anticlockwise +; both since lab mode began)}}: for the pages (10 a second while moving).
-#define DRIVE_JSON_LEN 800
+#define DRIVE_JSON_LEN 1300
 static int drive_json(char *out, size_t len, int viewer) {
     portENTER_CRITICAL(&drive_mux);
     int64_t now = esp_timer_get_time();
@@ -533,12 +536,25 @@ static int drive_json(char *out, size_t len, int viewer) {
     float pl = wheels_position(0), pr = wheels_position(1);
     portENTER_CRITICAL(&lab_mux);
     float ml = pl - L.origin[0], mr = pr - L.origin[1], tl = L.tgt[0] - L.origin[0], tr = L.tgt[1] - L.origin[1];
+    float xl = L.x[0] - L.origin[0], xr = L.x[1] - L.origin[1];          // the model's own position
+    float ap[2] = {L.ap[0], L.ap[1]}, ad[2] = {L.ad[0], L.ad[1]};
+    if (!L.active) ap[0] = ap[1] = ad[0] = ad[1] = 0;
     bool on = L.active, lim = L.limited;
     portEXIT_CRITICAL(&lab_mux);
     const float deg = 180 / (float)M_PI / WHEEL_BASE_MM;
-    n += snprintf(out + n, len - n, ",\"lab_kp\":%.2f,\"lab_zeta\":%.2f,\"lab\":{\"on\":%d,\"lim\":%d,\"s\":%.0f,"
-                  "\"st\":%.0f,\"h\":%.1f,\"ht\":%.1f}}", lab_cfg.kp, lab_cfg.zeta, on, lim, (ml + mr) / 2,
-                  (tl + tr) / 2, (mr - ml) * deg, (tr - tl) * deg);
+    n += snprintf(out + n, len - n, ",\"lab_kp\":%.2f,\"lab_zeta\":%.2f,\"lab_step\":%.0f,\"lab_turn\":%.0f,\"lab\":{\"on\":%d,\"lim\":%d,\"s\":%.0f,"
+                  "\"st\":%.0f,\"m\":%.0f,\"h\":%.1f,\"ht\":%.1f,\"mh\":%.1f}}", lab_cfg.kp, lab_cfg.zeta, lab_cfg.step_mm,
+                  lab_cfg.turn_deg, on, lim,
+                  (ml + mr) / 2, (tl + tr) / 2, (xl + xr) / 2, (mr - ml) * deg, (tr - tl) * deg, (xr - xl) * deg);
+    {
+        // Per wheel: the model's P and D (m/s^2), then the motor's feed-forward, P, I and total (% power).
+        float t[2][4];
+        wheels_ctl_terms(0, t[0]), wheels_ctl_terms(1, t[1]);
+        n--;
+        n += snprintf(out + n, len - n, ",\"pid\":[[%.2f,%.2f,%.1f,%.1f,%.1f,%.1f],[%.2f,%.2f,%.1f,%.1f,%.1f,%.1f]]}",
+                      ap[0] / 1000, ad[0] / 1000, t[0][0] * 100, t[0][1] * 100, t[0][2] * 100, t[0][3] * 100,
+                      ap[1] / 1000, ad[1] / 1000, t[1][0] * 100, t[1][1] * 100, t[1][2] * 100, t[1][3] * 100);
+    }
     return n;
 }
 
@@ -773,20 +789,15 @@ offline:                                    // red, one short flash every 1.5 s
     memcpy(out, t % 1500 < 150 ? RED : OFF, 3);
 }
 
-// The controller's colour while someone drives (the source a page sends with its commands).
-static void source_colour(const char *src, uint8_t out[3]) {
-    static const struct { const char *name; uint8_t c[3]; } C[] = {
-        {"pad", {0, 220, 255}}, {"touch", {0, 220, 255}}, {"mouse", {0, 220, 255}}, {"keyboard", {0, 220, 255}},  // cyan
-        {"gamepad", {255, 0, 200}},       // magenta
-        {"spacemouse", {0, 40, 255}},     // blue
-        {"handtool", {255, 90, 0}},       // orange
-        {"atlas", {255, 210, 0}},         // yellow
-    };
-    for (int i = 0; i < sizeof C / sizeof C[0]; i++) if (strcmp(src, C[i].name) == 0) { memcpy(out, C[i].c, 3); return; }
-    out[0] = out[1] = out[2] = 220;       // white: anything else (HTTP, scripts)
+// The drive mode's colour while someone drives (since 1.8.8; before, the controller's colour): power (also when speed or
+// lab mode fell back to it after an encoder fault) green-cyan, speed blue, lab magenta.
+static void mode_colour(uint8_t out[3]) {
+    static const uint8_t C[3][3] = {{0, 255, 100}, {0, 40, 255}, {255, 0, 200}};   // (power: green-cyan, unlike the blue)
+    int m = enc_fault >= 0 ? MODE_POWER : drive_mode;
+    memcpy(out, C[m <= MODE_LAB ? m : MODE_POWER], 3);
 }
 
-// The LED: Wi-Fi problems first (the Turtle's patterns); then, while someone drives, the controller's colour, brighter
+// The LED: Wi-Fi problems first (the Turtle's patterns); then, while someone drives, the drive mode's colour, brighter
 // the faster the robot goes (dim while it stands still, until DRIVE_HOLD_MS after the last movement); a red double blink for 3 s after a dead-man stop
 // (the commands stopped coming); otherwise the Wi-Fi quality, green - yellow - red.
 static void status_pattern(int64_t now_us, uint8_t out[3]) {
@@ -800,8 +811,6 @@ static void status_pattern(int64_t now_us, uint8_t out[3]) {
     bool recent = D.moving_us && now_us - D.moving_us < DRIVE_HOLD_MS * 1000LL;
     float speed = fmaxf(fabsf(D.out[0]), fabsf(D.out[1]));
     bool deadman = D.stopped_by_deadman && now_us - D.cmd_us < (DEADMAN_MS + 3000) * 1000LL;
-    char src[16];
-    strlcpy(src, D.src, sizeof src);
     portEXIT_CRITICAL(&drive_mux);
     if (deadman) {
         int k = t % 1000;
@@ -809,7 +818,7 @@ static void status_pattern(int64_t now_us, uint8_t out[3]) {
         out[0] = on ? 255 : 0, out[1] = out[2] = 0;
     } else if (owned || recent || speed > 0.01f) {
         uint8_t c[3];
-        source_colour(src, c);
+        mode_colour(c);
         float k = 0.25f + 0.75f * fminf(1.0f, speed / (cfg.max_pct / 100.0f));
         for (int i = 0; i < 3; i++) out[i] = (uint8_t)(c[i] * k);
     }
@@ -1560,7 +1569,7 @@ static esp_err_t drive_http(httpd_req_t *req) {
 }
 
 // Settings from JSON: {"max":100,"accel":25,"trim":0,"rev_left":0,"rev_right":0,"min":10,"mode":"power"|"speed"|"lab",
-// "lab_kp":39.5 (1/s^2),"lab_zeta":0.7,
+// "lab_kp":39.5 (1/s^2),"lab_zeta":0.7 (0..10),"lab_step":500 (mm, 10..2000),"lab_turn":90 (degrees, 1..360),
 // "kp":..,"ki":.. (speed control gains, also set by the calibration),"ble_code":"..."}; any subset.
 // The callers check control first; "ble_code" only from a holder with the server's grant (an admin through the site).
 static void settings_from(cJSON *j) {
@@ -1581,9 +1590,13 @@ static void settings_from(cJSON *j) {
     }
     if ((v = cJSON_GetObjectItem(j, "lab_kp")) && cJSON_IsNumber(v) && v->valuedouble >= 0.5 && v->valuedouble <= 10000)
         lab_cfg.kp = v->valuedouble;
-    if ((v = cJSON_GetObjectItem(j, "lab_zeta")) && cJSON_IsNumber(v) && v->valuedouble >= 0 && v->valuedouble <= 5) {
+    if ((v = cJSON_GetObjectItem(j, "lab_zeta")) && cJSON_IsNumber(v) && v->valuedouble >= 0 && v->valuedouble <= 10) {
         lab_cfg.zeta = v->valuedouble;
     }
+    if ((v = cJSON_GetObjectItem(j, "lab_step")) && cJSON_IsNumber(v) && v->valuedouble >= 10 && v->valuedouble <= 2000)
+        lab_cfg.step_mm = v->valuedouble;
+    if ((v = cJSON_GetObjectItem(j, "lab_turn")) && cJSON_IsNumber(v) && v->valuedouble >= 1 && v->valuedouble <= 360)
+        lab_cfg.turn_deg = v->valuedouble;
     cJSON *kp = cJSON_GetObjectItem(j, "kp"), *ki = cJSON_GetObjectItem(j, "ki");
     if (cJSON_IsNumber(kp) || cJSON_IsNumber(ki))
         wheels_set_gains(cJSON_IsNumber(kp) ? kp->valuedouble : NAN, cJSON_IsNumber(ki) ? ki->valuedouble : NAN);
@@ -1668,7 +1681,7 @@ static esp_err_t ws_handler(httpd_req_t *req) {
         answer = calibrate(fd, cJSON_IsTrue(cal) || (cJSON_IsNumber(cal) && cal->valueint));
     } else if (cJSON_IsObject(set)) {
         if (!closer_access_by_grant(fd)) cJSON_DeleteItemFromObject(set, "ble_code");   // (the fixed code: admins only)
-        if (closer_access_has(fd)) settings_from(set);
+        if (closer_access_has(fd)) { settings_from(set); closer_access_used(fd); }
         else answer = "{\"need\":1}";
     } else if (cJSON_IsNumber(x) && cJSON_IsNumber(y)) {
         if (!drive_command(fd, (float)x->valuedouble, (float)y->valuedouble, cJSON_IsString(src) ? src->valuestring : ""))

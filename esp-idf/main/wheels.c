@@ -160,11 +160,13 @@ float wheels_top_speed(void) { return 0.9f * P.vmax; }
 
 // ------------------------------------------------------------------ speed control
 
-static struct { float pos_ref, stuck_s; } C[2];
+static struct { float pos_ref, stuck_s, term[4]; } C[2];     // term: the last duty's feed-forward, P, I and total
 
 void wheels_ctl_reset(void) {
     for (int s = 0; s < 2; s++) C[s].pos_ref = pos_mm(s), C[s].stuck_s = 0;
 }
+
+void wheels_ctl_terms(int side, float t[4]) { for (int i = 0; i < 4; i++) t[i] = C[side].term[i]; }
 
 int wheels_control(const float v_ref[2], const float a_ref[2], float dt, float duty[2]) {
     int bad = -1;
@@ -174,17 +176,23 @@ int wheels_control(const float v_ref[2], const float a_ref[2], float dt, float d
             // Stopping: brake on the speed alone; let go once (nearly) still.
             C[s].pos_ref = pos_mm(s);
             u = fabsf(vel) < 20 ? 0 : -P.kp * vel;
+            C[s].term[0] = C[s].term[2] = 0, C[s].term[1] = u;
         } else {
             int d = v >= 0 ? 0 : 1;
-            float ff = (v > 0 ? P.ks[s][0] : -P.ks[s][1]) + P.kv[s][d] * v + P.ka[s] * a_ref[s];
+            // The offset: the dead zone (ks) keeps a turning wheel turning; a wheel that stands still needs the higher
+            // break-away duty (start) first, or a slow command does nothing until the integral has built up.
+            float off = P.ks[s][d] + (P.start[s][d] - P.ks[s][d]) * fmaxf(0, 1 - fabsf(vel) / 30);   // (blended: no chatter)
+            float ff = (v > 0 ? off : -off) + P.kv[s][d] * v + P.ka[s] * a_ref[s];
             C[s].pos_ref += v * dt;
             float e = C[s].pos_ref - pos_mm(s), lim = P.ki > 0 ? 0.3f / P.ki : 0;    // (the integral: at most 30 % duty)
             if (e > lim) C[s].pos_ref -= e - lim, e = lim;
             if (e < -lim) C[s].pos_ref += -lim - e, e = -lim;
             u = ff + P.kp * (v - vel) + P.ki * e;
+            C[s].term[0] = ff, C[s].term[1] = P.kp * (v - vel), C[s].term[2] = P.ki * e;
         }
         u = u > 1 ? 1 : u < -1 ? -1 : u;
         duty[s] = u;
+        C[s].term[3] = u;
         // Plenty of duty but the wheel stands still, or turns the other way: stalled, or the encoder is wrong.
         float plenty = fmaxf(0.4f, fmaxf(P.start[s][0], P.start[s][1]) + 0.15f);
         if (fabsf(u) > plenty && (fabsf(vel) < 15 || vel * u < 0)) C[s].stuck_s += dt;
