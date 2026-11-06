@@ -8,3 +8,7 @@ typedef void (*display_drive_fn)(float *left, float *right, bool *bluetooth);
 
 bool display_start(int sda, int scl, display_drive_fn drive);  // false when no display answers (then nothing happens)
 const char *display_found(void);                               // e.g. "ssd1306 0x3c", "" when none
+
+// The drive mode's name for the header ("Power", "Speed", "Lab"; NULL or "" shows none). Since 1.8.13.
+typedef const char *(*display_mode_fn)(void);
+void display_set_mode_fn(display_mode_fn fn);

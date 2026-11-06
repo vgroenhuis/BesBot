@@ -1,6 +1,7 @@
 // The OLED on I2C: see display.h. Laid out like the other lab demos' displays (LynXP, SpaceMouse, HandTool):
 //
-//   BesBot 1.6.1                        [Wi-Fi]     <- header: name, firmware version
+//   BesBot                     Speed    [Wi-Fi]     <- header: name and firmware version in turn (3 s each, like
+//                                                     LynXP), the drive mode
 //   ------------------------------------------
 //   Mojca_Vincent_Reel...         ch36 -56dBm     <- network (scrolls if too long), channel and signal
 //   192.168.0.37                                  <- address, the largest font that fits
@@ -42,6 +43,8 @@ static uint8_t sent[PAGES][W];
 static bool sent_valid;
 static char found[24];
 static display_drive_fn drive_fn;
+static display_mode_fn mode_fn;
+void display_set_mode_fn(display_mode_fn fn) { mode_fn = fn; }
 
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
@@ -207,9 +210,13 @@ static const uint8_t *const CODE_FONTS[] = {u8g2_font_logisoso42_tn, u8g2_font_l
                                             u8g2_font_logisoso16_tn};
 static marquee_t network_band;
 
+// The header: the title (with "version": the name and the firmware version in turn, 3 s each), the drive mode and
+// the Wi-Fi icon.
 static void header(const char *title, const closer_demo_status_t *st, bool version) {
-    text(0, 9, u8g2_font_helvB08_tr, title);
-    if (version) text(width(u8g2_font_helvB08_tr, title) + 4, 9, u8g2_font_helvR08_tr, closer_demo_version());
+    if (version && now_ms() / 3000 % 2) text(0, 9, u8g2_font_helvR08_tr, closer_demo_version());
+    else text(0, 9, u8g2_font_helvB08_tr, title);
+    const char *mode = version && mode_fn ? mode_fn() : NULL;
+    if (mode && mode[0]) text_right(110, 9, u8g2_font_helvR08_tr, mode);
     wifi_icon(115, 9, st->connected ? (st->rssi ? st->rssi : -60) : 0);
     u8g2_DrawHLine(&u8g2, 0, 11, W);
 }

@@ -31,7 +31,7 @@ menu "BesBot"
         int "GPIO of the on-board RGB LED"
         default 27
         help
-            ESP32-C5-DevKitC-1: the addressable RGB LED (WS2812) sits on GPIO27.
+            The Waveshare ESP32-C5 board (like the ESP32-C5-DevKitC-1) has its addressable RGB LED (WS2812) on GPIO27.
     config BESBOT_LED_SWAP_RG
         bool "The LED's red and green are swapped (Waveshare ESP32-C5 boards)"
         default y

@@ -138,9 +138,8 @@ static struct {
 #define OWNER_HTTP (-2)
 #define OWNER_BLE 1000           // + the Bluetooth connection handle (WebSocket fds are small numbers)
 
-// The Bluetooth access code: 6-32 characters, set by an admin (POST /api/settings or {"set":{"ble_code":..}} on /ws,
-// both admin-only through the lab demos site). "" = no driving over Bluetooth (stopping is always allowed).
-static char ble_code[33];
+// (Until 1.8.13 a fixed Bluetooth access code, NVS besbot/ble_code; since 1.8.14 Bluetooth takes control like the
+// pages do: the code on the display, or the token of a page that has it. The old key is erased at start.)
 
 static void settings_load(void) {
     nvs_handle_t h;
@@ -148,8 +147,6 @@ static void settings_load(void) {
     settings_t s;
     if (nvs_open("besbot", NVS_READONLY, &h) == ESP_OK) {
         if (nvs_get_blob(h, "settings", &s, &len) == ESP_OK && len == sizeof s) cfg = s;
-        len = sizeof ble_code;
-        if (nvs_get_str(h, "ble_code", ble_code, &len) != ESP_OK) ble_code[0] = 0;
         if (nvs_get_u8(h, "mode", &drive_mode) != ESP_OK || drive_mode > MODE_LAB) drive_mode = MODE_POWER;
         lab_cfg_t lc = lab_cfg;
         len = sizeof lc;
@@ -183,7 +180,7 @@ static void settings_save(void) {
     nvs_handle_t h;
     if (nvs_open("besbot", NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_blob(h, "settings", &cfg, sizeof cfg);
-        nvs_set_str(h, "ble_code", ble_code);
+        nvs_erase_key(h, "ble_code");
         nvs_set_u8(h, "mode", drive_mode);
         nvs_set_blob(h, "lab", &lab_cfg, sizeof lab_cfg);
         nvs_commit(h);
@@ -492,6 +489,12 @@ static void control_task(void *arg) {
 }
 
 // For the display: the motors' outputs and whether the driver is on Bluetooth.
+// The drive mode for the display's header (power also when speed or lab mode fell back to it).
+static const char *display_mode(void) {
+    static const char *N[] = {"Power", "Speed", "Lab"};
+    return N[enc_fault >= 0 || drive_mode > MODE_LAB ? MODE_POWER : drive_mode];
+}
+
 static void display_drive(float *left, float *right, bool *bluetooth) {
     portENTER_CRITICAL(&drive_mux);
     *left = D.out[0];
@@ -521,11 +524,11 @@ static int drive_json(char *out, size_t len, int viewer) {
     int n = snprintf(out, len, "{\"drive\":1,\"access\":\"%s\",\"code\":%d,"
                     "\"x\":%.2f,\"y\":%.2f,\"l\":%.2f,\"r\":%.2f,\"src\":\"%s\",\"driver\":\"%s\","
                     "\"via\":\"%s\",\"deadman\":%s,\"deadman_stops\":%lu,\"refused\":%lu,\"max\":%u,\"accel\":%u,\"trim\":%d,"
-                    "\"rev_left\":%u,\"rev_right\":%u,\"min\":%u,\"ble\":%d,\"ble_code\":%s,\"fw\":\"%s\",\"host\":\"%s\",\"display\":\"%s\"}",
+                    "\"rev_left\":%u,\"rev_right\":%u,\"min\":%u,\"ble\":%d,\"fw\":\"%s\",\"host\":\"%s\",\"display\":\"%s\"}",
                     closer_access_state(viewer), closer_access_code(NULL, 0, NULL, 0),
                     x, y, l, r, src, who, ble_driver ? "bluetooth" : "wifi", dm ? "true" : "false", (unsigned long)stops,
                     (unsigned long)refused, cfg.max_pct, cfg.accel_pct, cfg.trim, cfg.rev_left, cfg.rev_right, cfg.min_pct,
-                    closer_ble_running() ? closer_ble_connections() : -1, ble_code[0] ? "true" : "false",
+                    closer_ble_running() ? closer_ble_connections() : -1,
                     closer_demo_version(), closer_demo_name(), display_found());
     n--;                             // (over the closing brace)
     n += snprintf(out + n, len - n, ",\"mode\":\"%s\",\"fault\":\"%s\",\"cal\":\"%s\",\"calibrated\":%d,"
@@ -1294,17 +1297,15 @@ static void survey_task(void *arg) {
 // ------------------------------------------------------------------ Bluetooth
 // The /ws commands over Bluetooth LE (closer_ble), for places where the Wi-Fi is poor: a phone or laptop next to the
 // robot drives it directly. Anyone in range may connect and stop the robot; driving and settings need control
-// (closer_access.h: the same {"access":..} messages as on /ws), or the fixed access code set by an admin, which gives
-// control too: "code:<code>" -> {"auth":1} or {"auth":0}. A wrong fixed code makes every connection wait 2 s before
-// the next try (6 characters at least: guessing takes weeks). Each connection drives as OWNER_BLE + its handle, and
-// gets its own state 10 times a second while the robot moves (once a second otherwise), short enough for one
-// notification: {"drive":1,"l","r","driver","src","deadman","max","auth":0|1 (has control),"code":0|1 (fixed code set),
-// "access":"you"|"other"|"none","shown":seconds the control code is still shown}.
+// (closer_access.h: the same {"access":..} messages as on /ws: ask for the code on the display, or bring the token of
+// a page that has control). Each connection drives as OWNER_BLE + its handle, and gets its own state 10 times a second
+// while the robot moves (once a second otherwise), short enough for one notification: {"drive":1,"l","r","driver",
+// "src","deadman","max","auth":0|1 (has control),"access":"you"|"other"|"none","shown":seconds the control code is
+// still shown}. (The fixed access code, "code:<code>", is gone since 1.8.14: it answers {"auth":0,"gone":1}.)
 // "ping:x" comes back as "pong:x" (round-trip test). Losing the connection stops the robot at once if it drove.
 
 #define BLE_SLOTS 3
 static void settings_from(cJSON *j);
-static int64_t ble_code_wait_us;             // no code checks before this (after a wrong one)
 
 static bool ble_authed(int conn) { return closer_access_has(OWNER_BLE + conn); }
 
@@ -1318,8 +1319,8 @@ static int ble_state_json(char *out, size_t len, int conn) {
     bool dm = D.stopped_by_deadman;
     portEXIT_CRITICAL(&drive_mux);
     return snprintf(out, len, "{\"drive\":1,\"l\":%.2f,\"r\":%.2f,\"driver\":\"%s\",\"src\":\"%s\",\"deadman\":%d,\"max\":%u,"
-                    "\"auth\":%d,\"code\":%d,\"access\":\"%s\",\"shown\":%d}", l, r, who, src, dm, cfg.max_pct,
-                    ble_authed(conn), ble_code[0] != 0, closer_access_state(OWNER_BLE + conn),
+                    "\"auth\":%d,\"access\":\"%s\",\"shown\":%d}", l, r, who, src, dm, cfg.max_pct,
+                    ble_authed(conn), closer_access_state(OWNER_BLE + conn),
                     closer_access_code(NULL, 0, NULL, 0));
 }
 
@@ -1327,14 +1328,6 @@ static void ble_send_state(int conn) {
     char buf[200];
     ble_state_json(buf, sizeof buf, conn);
     closer_ble_notify(conn, buf);
-}
-
-static bool ble_code_ok(const char *given) {
-    // The same time whatever matches (no hint from how long the check takes).
-    size_t n = strlen(ble_code), m = strlen(given);
-    unsigned diff = n != m;
-    for (size_t i = 0; i < n; i++) diff |= (unsigned char)ble_code[i] ^ (unsigned char)(i < m ? given[i] : 0);
-    return n && !diff;
 }
 
 // In the Bluetooth task.
@@ -1352,17 +1345,8 @@ static void ble_command(int conn, const char *text) {
         ble_send_state(conn);
         return;
     }
-    if (strncmp(text, "code:", 5) == 0) {
-        int64_t now = esp_timer_get_time();
-        bool ok = false, waited = now >= ble_code_wait_us;
-        if (waited) {
-            ok = ble_code_ok(text + 5);
-            if (ok) closer_access_take(OWNER_BLE + conn);
-            else ble_code_wait_us = now + 2000 * 1000LL;
-        }
-        ESP_LOGI(TAG, "Bluetooth %d: code %s", conn, ok ? "accepted" : waited ? "wrong" : "too soon");
-        closer_ble_notify(conn, ok ? "{\"auth\":1}" : waited ? "{\"auth\":0}" : "{\"auth\":0,\"wait\":1}");
-        if (ok) ble_send_state(conn);
+    if (strncmp(text, "code:", 5) == 0) {        // (the fixed access code: gone since 1.8.14)
+        closer_ble_notify(conn, "{\"auth\":0,\"gone\":1}");
         return;
     }
     if (strcmp(text, "state") == 0) { ble_send_state(conn); return; }
@@ -1380,7 +1364,6 @@ static void ble_command(int conn, const char *text) {
     } else if (!ble_authed(conn)) {
         closer_ble_notify(conn, "{\"auth\":0,\"need\":1}");
     } else if (cJSON_IsObject(set)) {
-        cJSON_DeleteItemFromObject(set, "ble_code");           // the code is changed through the site only
         settings_from(set);
     } else if (cJSON_IsNumber(x) && cJSON_IsNumber(y)) {
         if (!drive_command(OWNER_BLE + conn, (float)x->valuedouble, (float)y->valuedouble,
@@ -1570,8 +1553,8 @@ static esp_err_t drive_http(httpd_req_t *req) {
 
 // Settings from JSON: {"max":100,"accel":25,"trim":0,"rev_left":0,"rev_right":0,"min":10,"mode":"power"|"speed"|"lab",
 // "lab_kp":39.5 (1/s^2),"lab_zeta":0.7 (0..10),"lab_step":500 (mm, 10..2000),"lab_turn":90 (degrees, 1..360),
-// "kp":..,"ki":.. (speed control gains, also set by the calibration),"ble_code":"..."}; any subset.
-// The callers check control first; "ble_code" only from a holder with the server's grant (an admin through the site).
+// "kp":..,"ki":.. (speed control gains, also set by the calibration)}; any subset.
+// The callers check control first.
 static void settings_from(cJSON *j) {
     cJSON *v;
     if ((v = cJSON_GetObjectItem(j, "max")) && cJSON_IsNumber(v) && v->valueint >= 10 && v->valueint <= 100) cfg.max_pct = v->valueint;
@@ -1600,10 +1583,6 @@ static void settings_from(cJSON *j) {
     cJSON *kp = cJSON_GetObjectItem(j, "kp"), *ki = cJSON_GetObjectItem(j, "ki");
     if (cJSON_IsNumber(kp) || cJSON_IsNumber(ki))
         wheels_set_gains(cJSON_IsNumber(kp) ? kp->valuedouble : NAN, cJSON_IsNumber(ki) ? ki->valuedouble : NAN);
-    if ((v = cJSON_GetObjectItem(j, "ble_code")) && cJSON_IsString(v)) {
-        size_t n = strlen(v->valuestring);
-        if (n == 0 || (n >= 6 && n < sizeof ble_code)) strlcpy(ble_code, v->valuestring, sizeof ble_code);
-    }
     settings_save();
 }
 
@@ -1636,7 +1615,6 @@ static esp_err_t settings_post(httpd_req_t *req) {
     body[got] = 0;
     cJSON *j = cJSON_Parse(body);
     if (!j) { httpd_resp_set_status(req, "400 Bad Request"); return send_json(req, "{\"error\":\"JSON expected\"}"); }
-    if (!closer_access_by_grant(OWNER_HTTP)) cJSON_DeleteItemFromObject(j, "ble_code");   // (the fixed code: admins only)
     settings_from(j);
     cJSON_Delete(j);
     char out[DRIVE_JSON_LEN];
@@ -1680,7 +1658,6 @@ static esp_err_t ws_handler(httpd_req_t *req) {
     } else if (cJSON_IsNumber(cal) || cJSON_IsBool(cal)) {
         answer = calibrate(fd, cJSON_IsTrue(cal) || (cJSON_IsNumber(cal) && cal->valueint));
     } else if (cJSON_IsObject(set)) {
-        if (!closer_access_by_grant(fd)) cJSON_DeleteItemFromObject(set, "ble_code");   // (the fixed code: admins only)
         if (closer_access_has(fd)) { settings_from(set); closer_access_used(fd); }
         else answer = "{\"need\":1}";
     } else if (cJSON_IsNumber(x) && cJSON_IsNumber(y)) {
@@ -1740,6 +1717,7 @@ void app_main(void) {
     snprintf(control_page, sizeof control_page, "q/%s", closer_demo_name());     // (the site sends it on to the drive page)
     closer_access_init(control_page, access_changed);
     closer_access_set_digits(2);       // (the user's choice: easy to type; 2 tries a code, and every code shows)
+    display_set_mode_fn(display_mode);
     if (CONFIG_BESBOT_OLED_SDA_GPIO >= 0) display_start(CONFIG_BESBOT_OLED_SDA_GPIO, CONFIG_BESBOT_OLED_SCL_GPIO, display_drive);
     led_strip_config_t sc = {.strip_gpio_num = CONFIG_BESBOT_LED_GPIO, .max_leds = 1, .led_model = LED_MODEL_WS2812,
                              .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB};

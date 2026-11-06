@@ -1,6 +1,6 @@
 # BesBot firmware (ESP-IDF)
 
-ESP-IDF 6.1 firmware for the BesBot (ESP32-C5-DevKitC-1 + L298N), replacing the Arduino code in `../src`
+ESP-IDF 6.1 firmware for the BesBot (Waveshare ESP32-C5 board + L298N), replacing the Arduino code in `../src`
 (which the original board ran). The ESP32 only drives IN1..IN4 of the L298N (ENA/ENB tied high); there is no display.
 
 * **Driving:** WebSocket `/ws`: send `"stream"` for the live state, `{"x":..,"y":..,"src":".."}` (turn right +, forward +,
@@ -39,10 +39,10 @@ ESP-IDF 6.1 firmware for the BesBot (ESP32-C5-DevKitC-1 + L298N), replacing the 
   closer_demo component, `components/closer_demo/include/closer_access.h`). Control comes with a code the robot
   shows on request (`{"access":"request"}`, valid 60 s; BesBot: 2 digits, 2 tries a code; on the display and in
   the serial log), with the lab demos site's grant (an admin:
-  "Take control"; a server link takes it only while nobody has it), or with the fixed Bluetooth code. A new holder takes
+  "Take control"; a server link takes it only while nobody has it). A new holder takes
   over; control ends on release, 10 minutes after the holder's connection closed (unless it comes back with its token), or
   after 30 minutes without a command, setting or calibration (since 1.8.11; 60 s and 10 minutes before). Driving and settings need control (`{"need":1}` otherwise; HTTP: `?token=` or
-  `X-Access-Token`); stop works for everyone; the fixed Bluetooth code can only be changed with the site's grant.
+  `X-Access-Token`); stop works for everyone.
   The state carries `"access":"you"|"other"|"none"` and `"code"` (seconds the code is still shown).
 * **Display** (since 1.4.0; this layout since 1.5.0): a 128x64 I2C OLED, SSD1306 (or SH1106:
   `CONFIG_BESBOT_OLED_SH1106`) at 0x3C/0x3D, SDA GPIO3 and SCL GPIO2 (`menuconfig`: BesBot). Laid out like the other
@@ -52,10 +52,10 @@ ESP-IDF 6.1 firmware for the BesBot (ESP32-C5-DevKitC-1 + L298N), replacing the 
   left; "Control given" for a moment after it was used. The drive state's `"display"` says what was found.
 * **Bluetooth LE** (since 1.1.0): the CloSer lab demo service of `closer_ble` (see `components/closer_demo/include/closer_ble.h`)
   with the `/ws` commands, for places with poor Wi-Fi. Anyone nearby may connect and stop the robot; driving and settings
-  need the access code first: `code:<code>` -> `{"auth":1}`. The code (6-32 characters, in NVS) is set by an admin through
-  the site (`{"set":{"ble_code":".."}}` on `/ws` or `POST /api/settings`; `""` switches Bluetooth driving off); a wrong code
-  blocks code checks for 2 s. Each connection gets its own state notification (`{"drive":1,"l","r","driver","src",
-  "deadman","max","auth","code"}`), losing the connection stops the robot if it drove. The site's drive page connects
+  need control, taken the same way as on `/ws` (`{"access":..}`: the code on the display, or the token of a page that
+  has control, which then moves to Bluetooth). The fixed Bluetooth access code (`code:<code>`, `ble_code`) is gone since
+  1.8.14. Each connection gets its own state notification (`{"drive":1,"l","r","driver","src","deadman","max","auth",
+  "access","shown"}`), losing the connection stops the robot if it drove. The site's drive page connects
   with Web Bluetooth (Chrome/Edge; not iPhone).
 * **Wi-Fi:** the closer_demo component (roaming, reporting to the lab demos site, over-the-air updates with rollback) and
   the Turtle's Wi-Fi meter: the LED as a signal light, `/api/wifi`, `/api/wifi/history` (10 minutes), `/api/wifi/aps`,
